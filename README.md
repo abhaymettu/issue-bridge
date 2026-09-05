@@ -133,11 +133,41 @@ long command delays every job behind it.
 
 ## Operating it
 
-- **Is it alive?** `cat ~/.config/issue-bridge/status.json` - written every
-  cycle, with `last_poll_ok`, `queue_depth`, `last_error` and `pat_expiry`.
+- **Is it alive?** `cat ~/.config/issue-bridge/status.json` - rewritten around
+  every poll and every job.
 - **Logs:** `~/.config/issue-bridge/poller.log`.
 - **Restart:** `launchctl kickstart -k gui/$(id -u)/bridge.poller`.
 - **Remove it:** `./uninstall.sh` (leaves the repo and its issues alone).
+
+Read the status fields for what they are. `last_poll_ok` is the last successful
+issue listing, not proof that any job finished. `queue_depth` is how many issues
+came back in the last batch once pull requests were dropped, so it stops at 30
+and is not the backlog. `last_drain_ts` moves when a job finishes being handled,
+`last_error` holds the last failure the poller survived, and `pat_expiry` is the
+token expiry GitHub reported, when it reports one. Status writes are best effort
+and skipped silently if they fail. Command output goes to GitHub, not to the
+log; the log is for the poller's own noise.
+
+`./uninstall.sh` removes the LaunchAgent and `~/.config/issue-bridge`, token,
+status and log included. Revoke the PAT on GitHub yourself.
+
+### Local checks
+
+```sh
+python3 bridge-poller.py --self-test
+python3 bridge-poller.py --once
+```
+
+`--self-test` is offline: parsing, allowlist matching, ttl rules, the comment
+budget, subprocess handling and the status write. It says nothing about GitHub
+access or launchd. `--once` runs one real cycle and will execute queued jobs, so
+stop the LaunchAgent first or the two race for the same issues.
+`ISSUE_BRIDGE_HOME` points both at a different config directory, which is how to
+try one without touching the installed lane.
+
+The LaunchAgent runs `bridge-poller.py` from the checkout you installed from.
+Move or delete that directory and the poller stops coming back; reinstall from
+the new path.
 
 ### Crashes and reboots
 
