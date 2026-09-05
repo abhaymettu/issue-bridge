@@ -168,13 +168,27 @@ several steps must share state, or when state has to be checked immediately
 before it is used, ask the operator for an allowlisted wrapper that does the
 whole sequence in one invocation.
 
-**Terminal panes do not survive a reboot.** If a command drives a terminal
-multiplexer or pane manager, a pane id saved yesterday may be gone or may now
-belong to something else. Never carry a pane id between jobs. The
-create-or-reuse, act, and read-back steps belong inside one wrapper invocation,
-because the bridge cannot sequence them for you.
+**One workspace per job.** If a command drives a terminal multiplexer, pane
+manager or interactive agent, that job should create its own fresh workspace and
+capture the id from the tool's own output, inside the one invocation. Pane ids
+do not survive a reboot: one saved yesterday may be gone, or may now belong to
+something else. Never carry a pane id between jobs and never write one into an
+issue body. The create, act, and read-back steps belong inside one wrapper
+invocation, because the bridge cannot sequence them for you.
 
 **No output proves nothing.** Some pane-driving commands (for example
 `herdr pane run`) print nothing on success. Exit 0 means the process you invoked
 succeeded, not that the work it handed off elsewhere did. Use the tool's own
 read-back or status operation, in the same wrapper, when it matters.
+
+## If your own browser is capped
+
+When your browsing is rate-limited or unavailable, ask the operator whether the
+lane allows a browser command on the Mac. If it does, one job is one page: the
+argv drives their browser wrapper and the text comes back in the result comment.
+
+Do not assume such a command exists, and if the argv is denied, do not look for
+another way to reach that browser. Send the URL and say what to extract, keep
+the output well under the 58,000-character budget, and treat the browser as
+signed in as the operator: nothing you would not want in the lane's issue
+history should be visited or printed.

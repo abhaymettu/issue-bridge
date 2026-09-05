@@ -131,6 +131,40 @@ label, drops pull requests, and runs what is left one at a time. There is no
 pagination: with more than 30 waiting, the rest come round on later cycles. A
 long command delays every job behind it.
 
+## Patterns
+
+### Borrowing the Mac's browser
+
+An agent whose own browsing is capped, blocked or absent can push the work down
+to a browser CLI on the Mac: the job's argv drives that tool locally and the
+page text comes back in the result comment. The Mac's browser is already signed
+in wherever you are, which is both why this works and why it deserves a narrow
+entry.
+
+Allowlist a wrapper, not the browser tool itself. A prefix like `browser-cli`
+accepts any URL and, in most such tools, arbitrary script to run in the page:
+that is every session that browser holds. A wrapper that takes a URL and prints
+extracted text, or that only visits hosts you named, keeps the boundary where
+you put it.
+
+Two limits shape what fits. One argv per job and no shell, so a flow of several
+dependent steps belongs inside the wrapper rather than across issues. And the
+result comment is truncated near 58,000 characters, so print the extraction, not
+the page.
+
+### One workspace per job
+
+A job that drives a terminal multiplexer, pane manager or interactive agent
+should create its own workspace inside that same invocation and read the id back
+from the tool's own output. Pane, window and session ids do not survive a
+reboot, and a stale id can name something else by the time the next job runs.
+The bridge keeps no state between jobs, so an id written into an issue body is a
+guess.
+
+A fresh workspace per job also keeps concurrent work apart: two jobs sharing one
+pane interleave their input. Create, act, read back, and tear down when the work
+is done, all in one wrapper.
+
 ## Operating it
 
 - **Is it alive?** `cat ~/.config/issue-bridge/status.json` - rewritten around
