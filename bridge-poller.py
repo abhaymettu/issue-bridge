@@ -170,10 +170,12 @@ def handle(cfg, issue):
                 % (rule, fm.get("ttl"), fm.get("queued_at")))
     elif not allowed(argv, cfg["allow"]):
         done = False
+        # The whole argv, not argv[0]: an entry like `git -C /srv/repo` denies on a
+        # later token, and naming only `git` would read as a lie.
         body = ("**denied** - `%s` is not on this machine's allowlist, so nothing ran.\n\n"
                 "This is final: refiling the same argv gets the same answer. Ask the "
                 "machine's owner to add it to `allow` in the poller config.\n"
-                % clip(argv[0], 200))
+                % clip(shlex.join(argv), 200))
     else:
         # Drop the label BEFORE running. A crash between here and the comment
         # loses the result, which is survivable; keeping the label would re-run
