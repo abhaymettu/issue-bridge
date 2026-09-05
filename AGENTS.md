@@ -36,13 +36,13 @@ That example matches a fresh install's allowlist.
 
 | Field | Required | Meaning |
 | ----- | -------- | ------- |
-| `argv` | yes | The command, as a **JSON array of strings, on one line**. Not a shell string. |
+| `argv` | yes | The command as a **JSON array of strings**, one line. Not a shell string. |
 | `rule` | no | `drain-on-wake` (default), `drop-if-stale`, or `alert`. |
 | `queued_at` | with `ttl` | UTC, `YYYY-MM-DDTHH:MM:SSZ`. |
-| `ttl` | no | Seconds from `queued_at`. Governs whether the job *starts*, not how long it may run. |
+| `ttl` | no | Seconds from `queued_at`. Governs whether the job *starts*, not its runtime. |
 
-There is no shell, so pipes, `&&`, globs, `$VARS` and `~` are not expanded by the bridge. Use the
-absolute paths the operator gave you.
+There is no shell, so pipes, `&&`, globs, `$VARS` and `~` are not expanded by
+the bridge. Use the absolute paths the operator gave you.
 
 The body looks like YAML but is parsed as plain `key: value` lines, not real
 YAML. Do not use multi-line arrays or YAML-quote the scheduling values. The same
@@ -56,7 +56,11 @@ POST /repos/OWNER/REPO/issues
 ```
 
 ```json
-{"title": "check Mac", "labels": ["exec-job"], "body": "---\nargv: [\"uname\", \"-a\"]\n---"}
+{
+  "title": "check Mac",
+  "labels": ["exec-job"],
+  "body": "---\nargv: [\"uname\", \"-a\"]\n---"
+}
 ```
 
 Keep the returned issue number. The title is for the human reading the queue;
