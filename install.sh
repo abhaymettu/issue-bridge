@@ -26,7 +26,15 @@ printf '%s\n' "$PAT" > "$CONF/github-token"
 chmod 600 "$CONF/github-token"
 
 if [ -f "$CONF/config.json" ]; then
-  echo "keeping the existing $CONF/config.json (edit 'allow' by hand)"
+  # The poller obeys that file, not what was just typed. Verifying a lane it is
+  # not watching would print SUCCESS for the wrong machine, or hang.
+  LABEL="$("$PY" -c 'import json,sys
+c = json.load(open(sys.argv[1]))
+if c.get("repo") != sys.argv[2]:
+    sys.exit("existing config watches %s, not %s. Edit or remove it, then rerun."
+             % (c.get("repo"), sys.argv[2]))
+print(c.get("label", "exec-job"))' "$CONF/config.json" "$REPO")"
+  echo "keeping $CONF/config.json - lane $REPO, label $LABEL (edit 'allow' by hand)"
 else
   cat > "$CONF/config.json" <<JSON
 {
@@ -36,6 +44,7 @@ else
   "poll_interval": 60
 }
 JSON
+  LABEL=exec-job
   echo "wrote $CONF/config.json - allow starts at [\"uname\"] until you widen it"
 fi
 
@@ -60,30 +69,25 @@ if "full_name" not in d:
 print("  ok:", d["full_name"], "(private)" if d.get("private") else "(PUBLIC - see README security)")'
 
 echo "creating labels ..."
-for l in exec-job exec-done exec-failed; do
+for l in "$LABEL" exec-done exec-failed; do
   api POST /labels "{\"name\":\"$l\",\"color\":\"ededed\"}" >/dev/null || true
 done
 
 echo "installing the LaunchAgent ..."
 mkdir -p "$HOME/Library/LaunchAgents"
-cat > "$PLIST" <<PLISTEOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>bridge.poller</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$PY</string>
-    <string>$HERE/bridge-poller.py</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>$CONF/poller.log</string>
-  <key>StandardErrorPath</key><string>$CONF/poller.log</string>
-</dict>
-</plist>
+# plistlib rather than a heredoc: a checkout path containing & or < would
+# otherwise produce a plist launchd refuses to parse.
+"$PY" - "$PY" "$HERE/bridge-poller.py" "$CONF/poller.log" "$PLIST" <<'PLISTEOF'
+import plistlib, sys
+py, script, log, out = sys.argv[1:5]
+with open(out, "wb") as f:
+    plistlib.dump({"Label": "bridge.poller",
+                   "ProgramArguments": [py, script],
+                   "RunAtLoad": True,
+                   "KeepAlive": True,
+                   "ThrottleInterval": 10,
+                   "StandardOutPath": log,
+                   "StandardErrorPath": log}, f)
 PLISTEOF
 
 launchctl bootout "$TARGET" 2>/dev/null || true
@@ -92,10 +96,10 @@ launchctl enable "$TARGET" 2>/dev/null || true
 echo "  loaded: $TARGET"
 
 echo "filing a verification job (uname -a) ..."
-BODY="$("$PY" -c 'import json; print(json.dumps({
+BODY="$("$PY" -c 'import json,sys; print(json.dumps({
  "title": "issue-bridge install check",
- "labels": ["exec-job"],
- "body": "---\nargv: [\"uname\", \"-a\"]\nrule: drain-on-wake\n---\n"}))')"
+ "labels": [sys.argv[1]],
+ "body": "---\nargv: [\"uname\", \"-a\"]\nrule: drain-on-wake\n---\n"}))' "$LABEL")"
 NUM="$(api POST /issues "$BODY" | "$PY" -c 'import json,sys
 d = json.load(sys.stdin)
 if "number" not in d:
@@ -105,14 +109,18 @@ echo "  issue #$NUM filed; the poller runs on a 60s cycle, so allow a minute"
 
 for _ in $(seq 1 36); do
   sleep 5
+  # Closed and commented, not just labelled: the label is the second of three
+  # calls the poller makes, and only the whole sequence proves the round trip.
   VERDICT="$(api GET "/issues/$NUM" | "$PY" -c 'import json,sys
 d = json.load(sys.stdin)
 names = [l["name"] for l in d.get("labels", [])]
-print("done" if "exec-done" in names else "failed" if "exec-failed" in names else "waiting")')"
+print("done" if d.get("state") == "closed" and d.get("comments", 0) > 0
+      and "exec-done" in names
+      else "failed" if "exec-failed" in names else "waiting")')"
   case "$VERDICT" in
     done)
       echo
-      echo "SUCCESS - issue #$NUM ran and closed exec-done. The bridge is live."
+      echo "SUCCESS - issue #$NUM ran, commented and closed exec-done. Live."
       echo "Next: widen \"allow\" in $CONF/config.json, then hand your agent AGENTS.md."
       exit 0 ;;
     failed)

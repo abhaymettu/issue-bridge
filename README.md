@@ -69,10 +69,9 @@ protocol is an issue body, and it is written down in [AGENTS.md](AGENTS.md).
    issue and confirm it also has an output comment and is closed; the installer
    does not check those.
 
-   Reinstalling keeps an existing `config.json` but replaces the token, and the
-   check job always uses the repo you just typed and the `exec-job` label. If
-   the kept config points somewhere else, the check tests a lane the poller is
-   not watching.
+   Reinstalling keeps an existing `config.json` and replaces the token. If that
+   config names a different repo, the installer stops rather than verify a lane
+   the poller is not watching.
 
 4. **Widen the allowlist.** It ships as `["uname"]` and nothing else runs. Edit
    `allow` in `~/.config/issue-bridge/config.json`:
