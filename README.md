@@ -52,7 +52,8 @@ protocol is an issue body, and it is written down in [AGENTS.md](AGENTS.md).
 3. **Install.**
 
    ```sh
-   git clone <this repo> issue-bridge && cd issue-bridge
+   git clone https://github.com/abhaymettu/issue-bridge.git
+   cd issue-bridge
    ./install.sh
    ```
 
