@@ -218,7 +218,65 @@ scoped to the allowlist.
   the crash case above means a job can run without leaving one. Do not put
   secrets in an issue body or print them into a result.
 
+## FAQ
+
+**Is this SSH or ngrok?** No. SSH gives you a session on a reachable machine and
+ngrok publishes a local service through a tunnel. This queues a command and
+returns its output later. Use it when a request and a reply are enough, and use
+SSH when you need a shell.
+
+**Is it a self-hosted runner or a webhook receiver?** Neither. It runs an argv
+out of an issue body, not an Actions workflow, and it polls rather than listening
+on a port. A self-hosted runner is also outbound-only, so "no inbound port" is
+not what separates them; the difference is that this is a command queue, with no
+workflow engine and no job isolation.
+
+**Is it an MCP server?** No. The protocol is a labelled issue with a small body.
+An agent may well use a GitHub MCP server to file that issue, but there is no MCP
+adapter here.
+
+**Does it work behind NAT?** Yes, that is the point. It needs outbound https to
+`api.github.com`, a valid token and repo permissions, and nothing mapped on the
+router. Being able to browse the web is not proof the API is reachable.
+
+**What happens while the Mac is asleep or offline?** A `drain-on-wake` job waits
+and runs once the machine is awake, logged in and able to reach GitHub. The
+bridge does not wake the Mac and does not run at the login window. A
+`drop-if-stale` or `alert` job whose window has passed is skipped and closed
+`exec-failed`.
+
+**How long until a job starts?** Usually under a minute: 60 seconds between
+cycles, 30 issues per cycle oldest first, run one at a time. Sleep, logout, a
+backlog or a long-running earlier job all add to that.
+
+**Can I give a job a deadline?** Only a start window. `drop-if-stale` with
+`queued_at` and `ttl` skips a job that was picked up too late; it does not stop
+one that is already running or cap how long it takes. `alert` behaves the same
+way today - a missed-window comment and `exec-failed`, no notification of any
+other kind. Missing or unparseable window data means the job runs.
+
+**Where do results go, and can I move files?** Into a comment on the issue: exit
+code, duration, stdout, stderr. Output over about 58,000 characters is truncated
+with a marker, and nothing is saved locally. There is no file transfer. To move
+something large, have an allowlisted command write it somewhere and read it back
+in bounded pieces, or use a channel of your own.
+
+**Why is my issue still open?** Check the label first: no label, no job. Then
+check that the Mac is awake and logged in, read `status.json`, and look for an
+earlier job still running. An open issue whose label is gone has already been
+picked up, and a crash can strand it there. Do not relabel or refile a
+side-effecting job until you know whether it ran.
+
+**Can two Macs share one lane?** No. Dropping the label is not a lock, so two
+pollers can fetch and run the same issue. Give each Mac its own repo, or its own
+label with one poller each.
+
+**Linux or Windows?** The poller is stdlib Python and does not care, but the
+installer, the LaunchAgent and these instructions are macOS. Nothing here sets up
+a systemd unit or a Windows service.
+
 ## Requirements
 
-macOS with `python3` and `curl` (both ship with the Xcode command line tools).
-No pip installs, no dependencies. Python standard library only.
+A logged-in macOS session, `python3` and `curl` (both ship with the Xcode command
+line tools), git to clone this, and reachable GitHub API access. No pip installs,
+no dependencies. Python standard library only.
