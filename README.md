@@ -29,8 +29,15 @@ router. It does need working GitHub API access and valid credentials, which is
 more than "the laptop can browse the web", and the commands you allow may make
 network connections of their own.
 
-Any agent that can open a GitHub issue can drive it. There is no SDK: the
-protocol is an issue body, and it is written down in [AGENTS.md](AGENTS.md).
+## Callers
+
+Anything that can open an issue and put the label on it can drive the bridge:
+Instinct, Claude Code, a ChatGPT or Gemini agent, a script, or you in the GitHub
+web UI. Those are callers, not integrations. Nothing here is bundled with any of
+them, and a chat session with no GitHub access cannot file a job on its own.
+
+There is no SDK. The protocol is an issue body, and it is written down in
+[AGENTS.md](AGENTS.md).
 
 ## Quickstart
 
@@ -98,6 +105,31 @@ protocol is an issue body, and it is written down in [AGENTS.md](AGENTS.md).
 5. **Hand your agent [AGENTS.md](AGENTS.md).** Paste it into the agent's system
    prompt, drop it in its repo, or just link it. Tell the agent which repo is
    the lane. That is the entire integration.
+
+## What the command runs in
+
+There is no shell. The poller starts the argv directly, so pipes, `&&`,
+redirection, globs, `~` and `$VARS` are not expanded by the bridge; they arrive
+as literal argument strings.
+
+Commands run as the logged-in user, in whatever environment launchd hands the
+LaunchAgent. The installer sets no working directory and no `PATH`, so an
+interactive shell's `PATH`, aliases and startup files are not there. Use
+absolute paths for executables and files, and make the allowlist entry match the
+argv the caller will actually send.
+
+Each command gets 900 seconds. On a timeout the result is `exit: null` with a
+`timeout after 900s` note and no partial output; anything the command already
+printed is lost. The timeout kills the command, not necessarily the processes it
+spawned.
+
+### Queue timing
+
+The poller sleeps 60 seconds between cycles, so a job waits up to about a minute
+before it starts. Each cycle asks for the 30 oldest open issues carrying the
+label, drops pull requests, and runs what is left one at a time. There is no
+pagination: with more than 30 waiting, the rest come round on later cycles. A
+long command delays every job behind it.
 
 ## Operating it
 
