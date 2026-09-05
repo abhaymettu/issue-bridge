@@ -1,119 +1,176 @@
-# AGENTS.md - how to run a command on the operator's Mac
+# AGENTS.md - run a command on the operator's Mac through a GitHub issue
 
-You can run commands on a specific person's Mac by filing a GitHub issue. A
-poller on that machine watches one designated repo, runs allowlisted commands,
-and answers in the issue. You never get a shell; you get one round trip per
-issue.
+You can run one allowlisted command on a specific person's Mac by creating a
+labelled GitHub issue. A poller on that machine watches one designated repo,
+runs the command, and answers in the issue. This is an asynchronous request and
+reply, not a shell: one command per issue, one round trip.
 
-Ask the operator which repo is the lane. Everything below happens on that repo.
+## Before you file anything
 
-## File the job
+Ask the operator for:
 
-Create an issue with **the label `exec-job`**, a short title, and a body that is
-YAML frontmatter:
+- the lane repo, as `owner/name`,
+- the job label, normally `exec-job`,
+- the command argv or wrapper scripts they have allowlisted,
+- any absolute paths those commands need.
+
+You need GitHub access that can create issues, **apply the label**, and read
+comments on that repo. Creating an issue without successfully applying the label
+does not queue anything.
+
+There is no API for reading the machine's allowlist. Do not probe for one, and
+do not look for ways around a denial.
+
+## File one command job
+
+Create an issue on the lane with the label `exec-job`, a short title, and a body
+that is YAML frontmatter:
 
 ```
 ---
 argv: ["uname", "-a"]
-rule: drain-on-wake
-queued_at: 2026-01-15T09:30:00Z
-ttl: 3600
 ---
 ```
+
+That example matches a fresh install's allowlist.
 
 | Field | Required | Meaning |
 | ----- | -------- | ------- |
-| `argv` | yes | The command, as a **JSON array of strings, on one line**. Not a shell string. `argv[0]` is the program; there is no shell, so no pipes, globs, `&&`, or `~`. |
+| `argv` | yes | The command, as a **JSON array of strings, on one line**. Not a shell string. |
 | `rule` | no | `drain-on-wake` (default), `drop-if-stale`, or `alert`. |
 | `queued_at` | with `ttl` | UTC, `YYYY-MM-DDTHH:MM:SSZ`. |
-| `ttl` | no | Seconds. Combined with `queued_at`, defines the window. |
+| `ttl` | no | Seconds from `queued_at`. Governs whether the job *starts*, not how long it may run. |
 
-Rules:
+There is no shell, so pipes, `&&`, globs, `$VARS` and `~` are not expanded by the bridge. Use the
+absolute paths the operator gave you.
 
-- `drain-on-wake` - runs whenever the Mac next comes back, however late. Use
-  this for anything idempotent. It is the default and usually the right answer.
-- `drop-if-stale` - if `ttl` seconds have passed since `queued_at`, it is not
-  run. Use this for anything time-sensitive, where doing it late is worse than
-  not doing it.
-- `alert` - same window as `drop-if-stale`; a miss is marked for the operator's
-  attention rather than quietly skipped.
+The body looks like YAML but is parsed as plain `key: value` lines, not real
+YAML. Do not use multi-line arrays or YAML-quote the scheduling values. The same
+lines are also accepted inside a code fence or bare with no `---` delimiters;
+frontmatter is the form to write.
 
-The body is also accepted inside a code fence, or bare with no `---` delimiters.
-Frontmatter written normally is the safe form.
+Over the REST API:
+
+```
+POST /repos/OWNER/REPO/issues
+```
+
+```json
+{"title": "check Mac", "labels": ["exec-job"], "body": "---\nargv: [\"uname\", \"-a\"]\n---"}
+```
+
+Keep the returned issue number. The title is for the human reading the queue;
+nothing is named after it.
 
 ### The label is the doorbell
 
-**An issue without the `exec-job` label is invisible to the poller.** It will sit
-open forever and nobody will tell you. If you file the issue and add the label in
-a second API call, check that the second call succeeded. Most "the bridge is
-broken" reports are a missing label.
+**An issue without the job label is invisible to the poller.** It sits open
+forever and nobody tells you. If you create the issue and add the label in a
+second call, check that the second call succeeded. Most "the bridge is broken"
+reports are a missing label.
 
-## Get the result
+## Scheduling fields, if the job is time-sensitive
 
-Within about **60 seconds** (one poll cycle; longer if the Mac is asleep or
-logged out), the poller:
+Omitted, `rule` is `drain-on-wake`: the job runs whenever the poller next
+reaches it, however late, and `ttl` is ignored. That is the right default for
+anything idempotent.
 
-1. comments on your issue with the exit code, duration, stdout and stderr,
-2. adds `exec-done` (exit 0) or `exec-failed` (anything else),
-3. closes the issue.
-
-So: poll your own issue. It is done when it is closed. Read the label for the
-verdict and the last comment for the output. Output is truncated near 58,000
-characters, with a marker saying how much was dropped - if you need more, have
-the command write a file and fetch it in a second job.
-
-### When it does not run
-
-You get a comment and an `exec-failed` close in every case, never silence:
-
-- **denied** - `argv[0]` is not on the operator's allowlist. This is **final**.
-  Refiling the identical command gets the identical denial. Ask the operator to
-  widen the allowlist; do not retry, and do not go looking for a way around it.
-- **not run, did not parse** - `argv` was not a JSON array of strings.
-- **not run, missed its window** - a `drop-if-stale` or `alert` job past its ttl.
-
-If the issue is still open after several minutes: the Mac is off, asleep, or
-logged out, or the label is missing. All of those are the operator's to fix.
-
-## Things that will bite you
-
-**Terminal panes do not survive a reboot.** If your command drives a terminal
-multiplexer or pane manager, pane ids are not stable across reboots - the id you
-saved yesterday may not exist, or may now be someone else's pane. Never hardcode
-a pane id across jobs. Create-or-reuse the workspace **inside the same job** that
-uses it, capture the id from that job's output, and use it only within that job.
-
-**A command that returns no output proves nothing.** Some pane-driving commands
-(for example `herdr pane run`) print nothing at all on success. Do not read an
-empty stdout as "it worked". Follow it with an explicit read (`herdr pane read`)
-in the same job, and check that.
-
-**Keep titles short.** Result artifacts are named from the issue title and get
-truncated around 48 characters. Long titles collide with each other. A short
-title plus a descriptive body is better in every way.
-
-**One command per issue.** There is no shell, so there is no chaining. Sequence
-work as separate issues, or as one script that is itself on the allowlist.
-
-**Check before you assume state.** The Mac may have rebooted, slept, or had
-files change since your last job. If a job depends on state from an earlier job,
-verify that state in the same job that relies on it.
-
-## Full example
-
-Title: `check site build`
-
-Label: `exec-job`
-
-Body:
+For a job that is worse late than not at all, add before the closing `---`:
 
 ```
----
-argv: ["git", "-C", "/Users/operator/code/site", "pull"]
 rule: drop-if-stale
-queued_at: 2026-01-15T09:30:00Z
+queued_at: CURRENT_UTC_TIMESTAMP
 ttl: 1800
----
 ```
 
-Then poll issue #N until it closes. `exec-done` plus the comment is your answer.
+Replace `CURRENT_UTC_TIMESTAMP` with the real time when you file it, as
+`YYYY-MM-DDTHH:MM:SSZ`. Never submit the placeholder and never copy a timestamp
+from an example or an earlier job: a past `queued_at` makes the job dead on
+arrival.
+
+`alert` is currently identical to `drop-if-stale`: it posts a missed-window
+comment and closes `exec-failed`. There is no notification, escalation, or
+attention label beyond ordinary GitHub behaviour. Do not rely on one.
+
+**Bad window data does not fail closed.** A missing, malformed, or unparseable
+`queued_at`, and an unrecognised `rule` name, all leave the job eligible to run.
+Validate time-sensitive fields yourself before you file.
+
+## Read the result
+
+Poll the issue you created, not the whole lane:
+
+```
+GET /repos/OWNER/REPO/issues/NUMBER
+GET /repos/OWNER/REPO/issues/NUMBER/comments
+```
+
+Normal completion, in this order:
+
+1. the poller comments the exit code, duration, stdout and stderr,
+2. it adds `exec-done` (exit 0) or `exec-failed` (anything else),
+3. it closes the issue.
+
+Read the poller's result comment, not simply the newest one, and look for the
+result label. A closed issue is not by itself proof of execution: people close
+issues too.
+
+The default cycle is 60 seconds between polls, not a promise that your job
+finishes within a minute. Jobs run one at a time in the order they were created,
+at most 30 per cycle, so a long earlier command delays yours. A single command
+may run for up to 900 seconds.
+
+A timeout or a failure to start the program reports `exit: null` with the reason
+in stderr. Timeouts keep no partial output, and processes the command spawned
+are not guaranteed to have stopped.
+
+Combined stdout and stderr are truncated near 58,000 characters with a marker
+saying how much was dropped. There is no artifact, no file download, and no
+second-job trick that gets around it: printing the same file again hits the same
+budget. If you need more, ask the operator for an allowlisted way to write the
+output somewhere and read it back in bounded pieces.
+
+## When it does not run, and when you cannot tell
+
+- **denied** - the argv did not match any allowed token prefix. The operator
+  allowlists whole prefixes, so this can be about any token, not only the
+  program name. It is **final** for that config: refiling the same argv gets the
+  same answer. Ask the operator to widen `allow`. Do not retry and do not look
+  for a bypass.
+- **did not parse** - `argv` was not a non-empty JSON array of strings on one
+  line. Fix it and file a new issue.
+- **missed its window** - the command did not run. Confirm the work is still
+  wanted before refiling it with a fresh deadline.
+- **non-zero exit, timeout, or start failure** - read stderr and check the
+  relevant state. A failure does not prove nothing happened.
+
+**An open issue with the label removed is ambiguous.** The poller drops the
+label before it starts the command, so that issue is either running now or was
+stranded by a crash or an API failure after the command already ran. Do not
+reapply the label and do not file a replacement: ask the operator to look at the
+issue and at `~/.config/issue-bridge/status.json`.
+
+An issue still open **with** its label means the poller has not reached it: the
+Mac is asleep, logged out or off, there is a backlog, or the poller is stopped
+or cannot reach GitHub. Those are the operator's to fix.
+
+## Multi-step work and stateful tools
+
+One issue is one command. The bridge cannot chain commands or feed one
+command's output into the next inside a job.
+
+Sequence independent steps as separate issues, waiting for each result. When
+several steps must share state, or when state has to be checked immediately
+before it is used, ask the operator for an allowlisted wrapper that does the
+whole sequence in one invocation.
+
+**Terminal panes do not survive a reboot.** If a command drives a terminal
+multiplexer or pane manager, a pane id saved yesterday may be gone or may now
+belong to something else. Never carry a pane id between jobs. The
+create-or-reuse, act, and read-back steps belong inside one wrapper invocation,
+because the bridge cannot sequence them for you.
+
+**No output proves nothing.** Some pane-driving commands (for example
+`herdr pane run`) print nothing on success. Exit 0 means the process you invoked
+succeeded, not that the work it handed off elsewhere did. Use the tool's own
+read-back or status operation, in the same wrapper, when it matters.
