@@ -64,10 +64,9 @@ protocol is an issue body, and it is written down in [AGENTS.md](AGENTS.md).
    It asks for the repo and the token, writes `~/.config/issue-bridge/`
    (token at mode 600), loads the LaunchAgent, creates the `exec-job`,
    `exec-done` and `exec-failed` labels, then files a real `uname -a` job and
-   waits up to three minutes for it to come back. `SUCCESS` means the installer
-   saw the `exec-done` label land, which is the round trip working. Open the
-   issue and confirm it also has an output comment and is closed; the installer
-   does not check those.
+   waits up to three minutes for it to come back. `SUCCESS` means that job ran,
+   commented its output and closed `exec-done`: the whole round trip, not one
+   label.
 
    Reinstalling keeps an existing `config.json` and replaces the token. If that
    config names a different repo, the installer stops rather than verify a lane
