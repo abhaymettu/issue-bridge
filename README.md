@@ -23,9 +23,11 @@ issue. That is the whole system: one Python file, one LaunchAgent, one repo.
                                  issue closed                    status.json
 ```
 
-The Mac only ever makes outbound https requests to `api.github.com`. No inbound
-port, no tunnel, no VPN, no dynamic DNS, nothing to forward on your router. If
-your laptop can browse the web, the bridge works.
+The bridge itself only ever makes outbound https requests to `api.github.com`.
+No inbound port, no tunnel, no VPN, no dynamic DNS, nothing to forward on your
+router. It does need working GitHub API access and valid credentials, which is
+more than "the laptop can browse the web", and the commands you allow may make
+network connections of their own.
 
 Any agent that can open a GitHub issue can drive it. There is no SDK: the
 protocol is an issue body, and it is written down in [AGENTS.md](AGENTS.md).
@@ -33,8 +35,9 @@ protocol is an issue body, and it is written down in [AGENTS.md](AGENTS.md).
 ## Quickstart
 
 1. **Pick a repo to use as the lane.** A dedicated private repo is best. Anyone
-   who can file an issue on it can run your allowlisted commands, so the repo's
-   collaborator list *is* the guest list. See [Security](#security).
+   who can put the job label on an issue there can run your allowlisted
+   commands, and anyone who can edit an eligible issue's body can change what
+   runs. See [Security and delivery limits](#security-and-delivery-limits).
 
 2. **Create a fine-grained personal access token.** GitHub → Settings →
    Developer settings → Personal access tokens → Fine-grained tokens →
@@ -60,9 +63,15 @@ protocol is an issue body, and it is written down in [AGENTS.md](AGENTS.md).
    It asks for the repo and the token, writes `~/.config/issue-bridge/`
    (token at mode 600), loads the LaunchAgent, creates the `exec-job`,
    `exec-done` and `exec-failed` labels, then files a real `uname -a` job and
-   waits for it to come back. It prints `SUCCESS` when the round trip closes
-   `exec-done`. That success line is the verification test - if you see it, the
-   bridge works end to end.
+   waits up to three minutes for it to come back. `SUCCESS` means the installer
+   saw the `exec-done` label land, which is the round trip working. Open the
+   issue and confirm it also has an output comment and is closed; the installer
+   does not check those.
+
+   Reinstalling keeps an existing `config.json` but replaces the token, and the
+   check job always uses the repo you just typed and the `exec-job` label. If
+   the kept config points somewhere else, the check tests a lane the poller is
+   not watching.
 
 4. **Widen the allowlist.** It ships as `["uname"]` and nothing else runs. Edit
    `allow` in `~/.config/issue-bridge/config.json`:
@@ -77,10 +86,15 @@ protocol is an issue body, and it is written down in [AGENTS.md](AGENTS.md).
    ```
 
    Each entry is a **token prefix** of the argv it permits. `"herdr"` allows
-   every `herdr` subcommand. `"git -C /Users/you/code/site"` allows `git` only
-   against that one checkout - `git -C /etc pull` is denied. Matching is on
-   whole tokens, so `uname` never matches `unamex`. The config is re-read every
-   cycle; no restart needed.
+   every `herdr` subcommand. Matching is on whole tokens, so `uname` never
+   matches `unamex`. The config is re-read at the top of every cycle, so a change
+   needs no restart, but it does not reach a batch already being processed.
+
+   `"git -C /Users/you/code/site"` matches only argvs opening with those exact
+   tokens, so `git -C /etc pull` is denied. It does not confine git to that
+   checkout: later options, subcommands, hooks and config still apply. When an
+   operation needs real constraints, allowlist a wrapper script you wrote, not a
+   prefix of a general-purpose tool.
 
 5. **Hand your agent [AGENTS.md](AGENTS.md).** Paste it into the agent's system
    prompt, drop it in its repo, or just link it. Tell the agent which repo is
@@ -103,37 +117,45 @@ supervisor.
 Reboots are different, and worth being blunt about. This is a **LaunchAgent in
 the gui domain**, so it starts **at login, not at boot**. A Mac that reboots and
 sits at the login window is not running the bridge. If you log out, the bridge
-stops. If you want it to survive an unattended reboot, enable automatic login,
-or move the job to a LaunchDaemon and accept that it then runs as root - which
-is a much larger blast radius than this design assumes.
+stops. To survive an unattended reboot, either enable automatic login and accept
+what that costs, or run it as a LaunchDaemon instead. A LaunchDaemon is a
+separate deployment this installer does not write; it can be pointed at a
+non-root `UserName`, so it does not have to mean running commands as root.
 
-## Security
+## Security and delivery limits
 
-**The boundary is "can file an issue on the designated repo."** That is it.
-Anyone with issue-write on that repo - collaborators, org members with access,
-any bot or agent holding a token for it - can run anything your allowlist
-permits. Treat it exactly like handing out shell access, scoped to the
-allowlist.
+**The boundary is an open issue carrying the job label on the designated repo.**
+The poller checks neither who opened the issue nor who applied the label. Anyone
+who can label an issue there, or edit the body of one waiting to run, can run
+anything your allowlist permits. Treat it exactly like handing out shell access,
+scoped to the allowlist.
 
 - **Use a dedicated private repo** as the lane, especially if the allowlisted
   commands are powerful. Some tools grant far more than they look like they do:
   a terminal-driving CLI on your allowlist is effectively full access to your
   drive and everything logged into on it.
 - **The allowlist caps accidents, not attackers.** It stops a confused agent
-  from running the wrong thing. It is not a sandbox, and a command that itself
-  takes arbitrary input (a shell, an interpreter, `ssh`) hands the whole boundary
-  away. Do not allowlist those.
-- **Denials are final and visible.** A denied job gets a comment saying it was
-  denied and closes `exec-failed`. Nothing is ever dropped silently, so a wrong
-  allowlist shows up as a closed issue, not as a mystery.
-- **Side effects never run twice.** The poller removes the `exec-job` label
-  before running the command. If it crashes mid-job you may lose the *output*,
-  but the command does not re-run when it restarts.
-- **The token is write-scoped to one repo**, kept at mode 600, and never
-  printed, logged, or passed on a command line. Revoke it on GitHub to kill the
-  lane instantly.
-- **Everything is auditable after the fact.** Every job is an issue with a
-  comment: what was asked, what ran, what came back, when it closed.
+  from running the wrong thing. It is not a sandbox: commands run as you, with
+  your files and your credentials, and a command that itself takes arbitrary
+  input (a shell, an interpreter, `ssh`) hands the whole boundary away. Do not
+  allowlist those.
+- **Denials are final and visible.** A denied job gets a comment saying so and
+  closes `exec-failed`, so a wrong allowlist shows up as a closed issue rather
+  than as a mystery.
+- **Side effects are unlikely to run twice, not guaranteed not to.** The poller
+  drops the label before running, which is what stops a restart from re-running
+  a command. It is not a lock: two pollers on one lane, a relabel, or a refiled
+  issue will each run the command again. Run one poller per lane.
+- **A crash can leave no result at all.** The order is comment, then result
+  label, then close. A crash or an API failure part way through leaves an open,
+  unlabelled issue and possibly no record of what happened, even though the
+  command ran. Do not retry a side-effecting job whose outcome is unknown.
+- **The token is scoped to one repo**, kept at mode 600, and never printed,
+  logged, or passed on a command line. Revoking it stops all further API calls,
+  but not a command already running. Commands running as you can read the file.
+- **Issues are a good work record, not an audit log.** They are editable, and
+  the crash case above means a job can run without leaving one. Do not put
+  secrets in an issue body or print them into a result.
 
 ## Requirements
 
