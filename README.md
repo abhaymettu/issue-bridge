@@ -46,8 +46,9 @@ protocol is an issue body, and it is written down in [AGENTS.md](AGENTS.md).
    | Permission | Access |
    | ---------- | ------ |
    | Issues     | Read and write |
-   | Contents   | Read and write |
    | Metadata   | Read (GitHub forces this on) |
+
+   The bridge never touches repository contents; do not grant Contents.
 
    Set an expiry you will actually notice. The poller records the expiry date in
    `~/.config/issue-bridge/status.json` so you can check it before it bites.

@@ -14,7 +14,7 @@ command -v curl >/dev/null || { echo "curl not found on PATH"; exit 1; }
 read -r -p "Designated repo (owner/name): " REPO
 [ -n "$REPO" ] || { echo "a repo is required"; exit 1; }
 echo "Paste a fine-grained PAT scoped to $REPO only"
-echo "  (Issues: read/write, Contents: read/write, Metadata: read)"
+echo "  (Issues: read/write, Metadata: read - nothing else)"
 read -r -s -p "PAT: " PAT
 echo
 [ -n "$PAT" ] || { echo "a token is required"; exit 1; }
