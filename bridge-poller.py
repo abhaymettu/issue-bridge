@@ -22,7 +22,8 @@ COMMENT_BUDGET = 58000  # GitHub caps a single comment at 65536 chars
 TIMEOUT = 900           # per-command wall clock
 
 _status = {"version": VERSION, "ts": 0, "last_poll_ok": None, "last_drain_ts": None,
-           "queue_depth": 0, "last_error": None, "pat_expiry": None}
+           "queue_depth": 0, "last_error": None, "pat_expiry": None,
+           "pending_writebacks": []}
 
 
 def config():
@@ -150,8 +151,155 @@ def budget(out, err):
     return clip(out, COMMENT_BUDGET - len(err)), err
 
 
+
+# --- local deployment patch: result block + retryable writeback
+# (not upstream; re-apply after a pull)
+RESULT_BLOCK_TAIL = 4096  # chars kept per stream, from the END of the stream
+MARKER = "<!-- issue-bridge:result"
+PENDING = HOME / "pending"  # one <issue>.json per writeback that is not finished
+WRITEBACK_STEPS = ("body", "comment", "label", "close")
+
+
+def _rb_tail(s):
+    return s if len(s) <= RESULT_BLOCK_TAIL else (
+        "...[%d chars dropped from the start]\n%s"
+        % (len(s) - RESULT_BLOCK_TAIL, s[-RESULT_BLOCK_TAIL:]))
+
+
+def _rb_body(orig_body, r):
+    """The issue body with the bounded result block appended, or None if the body
+    already carries a block.
+
+    The comment stays the human record. The body block gives a caller that polls
+    the issue a stable machine-readable record without fetching the comments
+    endpoint: an <!-- issue-bridge:result {...} --> marker whose JSON carries exit,
+    duration and ts, then the last 4KB of each stream in fences. A second append is
+    refused, so a re-handled issue keeps one block.
+    """
+    if MARKER in orig_body:
+        return None
+    meta = json.dumps({"exit": r["exit"], "duration": r["duration"],
+                       "ts": now()}, separators=(",", ":"))
+    block = ("\n\n<!-- %s %s -->\n\n"
+             "**stdout (last %d chars)**\n```\n%s\n```\n"
+             "**stderr (last %d chars)**\n```\n%s\n```\n"
+             % ("issue-bridge:result", meta,
+                RESULT_BLOCK_TAIL, _rb_tail(r["stdout"]),
+                RESULT_BLOCK_TAIL, _rb_tail(r["stderr"])))
+    if len(orig_body) + len(block) > 60000:  # GitHub caps a body at 65536
+        orig_body = orig_body[:60000 - len(block)]
+    return orig_body + block
+
+
+# --- writeback journal --------------------------------------------------
+# The label is dropped before the command runs, so the label cannot say whether a
+# job already executed. This journal can: one file per job, written before the
+# first writeback attempt and deleted only when every step is done. run() is not
+# reachable from any retry path, so a retry can never execute a command twice.
+
+def pending_path(n):
+    return PENDING / ("%d.json" % n)
+
+
+def save_pending(rec):
+    PENDING.mkdir(parents=True, exist_ok=True, mode=0o700)  # holds command output
+    tmp = pending_path(rec["issue"]).with_suffix(".tmp")
+    tmp.write_text(json.dumps(rec, indent=1) + "\n")
+    tmp.replace(pending_path(rec["issue"]))
+
+
+def load_pending(n):
+    try:
+        rec = json.loads(pending_path(n).read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) and rec.get("issue") == n else None
+
+
+def iter_pending():
+    """(path, record) per journal entry; record is None when the file is unusable."""
+    for path in sorted(PENDING.glob("*.json")):
+        try:
+            rec = json.loads(path.read_text())
+        except (OSError, ValueError) as e:
+            _status["last_error"] = "unreadable writeback journal %s: %r" % (path.name, e)
+            rec = None
+        yield path, rec if isinstance(rec, dict) and isinstance(rec.get("issue"), int) else None
+
+
+def pending_status():
+    """What an operator or a monitor reads. Survives restarts because it is derived
+    from the journal files, not from a scalar that the next poll overwrites."""
+    out = []
+    for path, rec in iter_pending():
+        if rec is None:
+            out.append({"file": path.name, "unreadable": True})
+            continue
+        steps = rec.get("steps") or {}
+        out.append({"issue": rec["issue"], "attempts": rec.get("attempts", 0),
+                    "steps_left": [k for k in WRITEBACK_STEPS if not steps.get(k)],
+                    "created": rec.get("created"), "last_error": rec.get("last_error")})
+    return out
+
+
+def writeback(cfg, rec):
+    """Finish, or resume, the writeback for one job that has already executed.
+
+    Every step is idempotent (the body PATCH is guarded by the marker, relabel
+    tolerates a missing label, closing a closed issue is a no-op) and each
+    completion is journalled, so a retry repeats no step. Returns True when the
+    journal entry is retired.
+    """
+    n, steps = rec["issue"], rec.setdefault("steps", {})
+    try:
+        if not steps.get("body"):
+            if rec.get("body") is not None:
+                gh(cfg, "PATCH", "/issues/%d" % n, {"body": rec["body"]})
+            steps["body"] = True
+            save_pending(rec)
+        if not steps.get("comment"):
+            gh(cfg, "POST", "/issues/%d/comments" % n, {"body": rec["comment"]})
+            steps["comment"] = True
+            save_pending(rec)
+        if not steps.get("label"):
+            relabel(cfg, n, "exec-done" if rec.get("done") else "exec-failed")
+            steps["label"] = True
+            save_pending(rec)
+        if not steps.get("close"):
+            gh(cfg, "PATCH", "/issues/%d" % n,
+               {"state": "closed",
+                "state_reason": "completed" if rec.get("done") else "not_planned"})
+            steps["close"] = True
+    except Exception as e:  # retried next cycle; the journal keeps the result
+        rec["attempts"] = rec.get("attempts", 0) + 1
+        rec["last_error"] = "%s %r" % (now(), e)
+        save_pending(rec)
+        _status["last_error"] = "writeback issue #%d: %r" % (n, e)
+        print("writeback issue #%d incomplete (attempt %d, steps left %s): %r"
+              % (n, rec["attempts"], [k for k in WRITEBACK_STEPS if not steps.get(k)], e),
+              flush=True)
+        return False
+    pending_path(n).unlink(missing_ok=True)
+    return True
+
+
+def drain_pending(cfg):
+    """Retry unfinished writebacks from earlier cycles. These issues have already
+    lost the label, so the poll query never returns them again."""
+    for _, rec in list(iter_pending()):
+        if rec:
+            writeback(cfg, rec)
+# --- end local deployment patch ---
+
+
 def handle(cfg, issue):
     n = issue["number"]
+    rec = load_pending(n)
+    if rec:
+        # A journal entry means this job already executed (or was already answered).
+        # Finish the paperwork; do not parse, and above all do not run, again.
+        return writeback(cfg, rec)
+    r = None
     fm = parse(issue.get("body"))
     rule = fm.get("rule", "drain-on-wake")
     try:
@@ -181,22 +329,34 @@ def handle(cfg, issue):
         # loses the result, which is survivable; keeping the label would re-run
         # a command with side effects, which is not.
         relabel(cfg, n, None)
+        # Journal before running. If the poller dies mid-command the next cycle
+        # finds this entry, says so on the issue, and does not run it again.
+        save_pending({"issue": n, "done": False, "body": None, "steps": {},
+                      "attempts": 0, "created": now(), "argv": shlex.join(argv),
+                      "comment": "**result lost** - the poller stopped between starting "
+                                 "`%s` and recording its output. The command may have run; "
+                                 "it will not be run again. Refile if you still need it.\n"
+                                 % clip(shlex.join(argv), 200)})
         r = run(argv)
         out, err = budget(r["stdout"], r["stderr"])
         done = r["exit"] == 0
         body = ("exit: `%s`  duration: `%ss`\n\n**stdout**\n```\n%s\n```\n"
                 "**stderr**\n```\n%s\n```\n" % (r["exit"], r["duration"], out, err))
 
-    # Comment first: the result is the part worth keeping if the next call fails.
-    gh(cfg, "POST", "/issues/%d/comments" % n, {"body": body})
-    relabel(cfg, n, "exec-done" if done else "exec-failed")
-    gh(cfg, "PATCH", "/issues/%d" % n,
-       {"state": "closed", "state_reason": "completed" if done else "not_planned"})
+    # --- local deployment patch: journalled writeback (not upstream)
+    # denied, unparseable and stale jobs never ran, so they carry no result block
+    rec = {"issue": n, "done": done, "comment": body, "steps": {}, "attempts": 0,
+           "created": now(), "body": _rb_body(issue.get("body") or "", r) if r else None}
+    save_pending(rec)
+    return writeback(cfg, rec)
+    # --- end local deployment patch ---
 
 
 # --- loop ---------------------------------------------------------------
 
 def cycle(cfg):
+    drain_pending(cfg)  # unfinished writebacks first: their issues lost the label
+    _status["pending_writebacks"] = pending_status()
     q = urllib.parse.quote(cfg["label"])
     try:
         issues = gh(cfg, "GET", "/issues?state=open&labels=%s&sort=created"
@@ -218,12 +378,14 @@ def cycle(cfg):
             _status["last_drain_ts"] = time.time()
         except Exception as e:  # one bad job must not stop the lane
             _status["last_error"] = "issue #%d: %r" % (issue["number"], e)
+        _status["pending_writebacks"] = pending_status()
         write_status()
 
 
 def self_test():
-    """Offline check of the parts that decide whether a command runs."""
-    global STATUS
+    """Offline check of the parts that decide whether a command runs, and of the
+    writeback journal that decides whether a result can be lost."""
+    global STATUS, PENDING
     results = []
 
     def check(name, cond):
@@ -270,8 +432,67 @@ def self_test():
         write_status()
         check("status failure is not fatal", True)
 
+    # --- writeback journal (local deployment patch) ---
+    with tempfile.TemporaryDirectory() as d:
+        STATUS = pathlib.Path(d) / "status.json"
+        PENDING = pathlib.Path(d) / "pending"
+        real_gh, real_run = gh, run
+        calls, runs, state = [], [], {"body": "", "closed": False, "labels": []}
+        fail = {"body_patch": True}
+
+        def fake_gh(cfg, method, path, body=None):
+            calls.append((method, path))
+            if method == "PATCH" and body and "body" in body:
+                if fail["body_patch"]:
+                    raise OSError("simulated body PATCH failure")
+                state["body"] = body["body"]
+            if method == "PATCH" and body and body.get("state") == "closed":
+                state["closed"] = True
+            if method == "POST" and path.endswith("/labels"):
+                state["labels"] += body["labels"]
+            return {}
+
+        def fake_run(argv):
+            runs.append(argv)
+            return {"exit": 0, "stdout": "out", "stderr": "", "duration": 0.01}
+
+        globals()["gh"], globals()["run"] = fake_gh, fake_run
+        try:
+            cfg = {"repo": "x/y", "label": "exec-job", "allow": ["uname"]}
+            issue = {"number": 11,
+                     "body": '---\nargv: ["uname", "-m"]\nrule: drain-on-wake\n---\n'}
+            handle(cfg, dict(issue))
+            comments = lambda: len([c for c in calls if c[0] == "POST"
+                                    and c[1].endswith("/comments")])
+            check("failed writeback keeps a journal entry", load_pending(11) is not None)
+            check("failed writeback is observable in status",
+                  pending_status()[0]["issue"] == 11 and pending_status()[0]["attempts"] == 1)
+            check("marker absent while the PATCH fails", MARKER not in state["body"])
+
+            handle(cfg, dict(issue))  # same issue seen again, label race or restart
+            check("resume does not re-run the command", len(runs) == 1)
+            check("resume does not duplicate the comment", comments() <= 1)
+
+            fail["body_patch"] = False
+            drain_pending(cfg)
+            check("retry lands the result marker", MARKER in state["body"])
+            check("retry closes the issue", state["closed"])
+            check("retry posts exactly one comment", comments() == 1)
+            check("retry labels once", state["labels"] == ["exec-done"])
+            check("journal retired after success", load_pending(11) is None
+                  and pending_status() == [])
+            check("command ran exactly once", len(runs) == 1)
+
+            # a denied job never runs, so it carries no result block and no journal
+            handle(cfg, {"number": 12,
+                         "body": '---\nargv: ["rm", "-rf", "/"]\nrule: drain-on-wake\n---\n'})
+            check("denied job does not run", len(runs) == 1)
+            check("denied job leaves no journal", load_pending(12) is None)
+        finally:
+            globals()["gh"], globals()["run"] = real_gh, real_run
+
     for name, ok in results:
-        print("%-32s %s" % (name, "PASS" if ok else "FAIL"))
+        print("%-42s %s" % (name, "PASS" if ok else "FAIL"))
     bad = sum(1 for _, ok in results if not ok)
     print("\n%d/%d passed" % (len(results) - bad, len(results)))
     return 1 if bad else 0
