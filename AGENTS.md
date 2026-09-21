@@ -146,9 +146,16 @@ finishes within a minute. Jobs run one at a time in the order they were created,
 at most 30 per cycle, so a long earlier command delays yours. A single command
 may run for up to 900 seconds.
 
+Each job runs in its own visible Orca terminal on the Mac, titled `#<issue>
+<title>`, under the `bridge-jobs` workspace. It is the same command with the
+same result; the difference is that a person at the machine can watch it. If
+Orca is not reachable the job runs as a hidden child of the poller instead, and
+the last stderr line says so.
+
 A timeout or a failure to start the program reports `exit: null` with the reason
-in stderr. Timeouts keep no partial output, and processes the command spawned
-are not guaranteed to have stopped.
+in stderr. A job that timed out in its Orca terminal keeps what it printed
+before the terminal was closed; one that ran hidden keeps nothing. Processes
+the command spawned are not guaranteed to have stopped.
 
 Combined stdout and stderr are truncated near 58,000 characters with a marker
 saying how much was dropped. There is no artifact, no file download, and no

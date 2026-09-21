@@ -182,6 +182,37 @@ The pre-Orca tmux and herdr backend is kept verbatim as `lane-herdr` beside the
 wrapper. `ISSUE_BRIDGE_LANE_BACKEND=herdr` hands the whole invocation to it.
 Nothing on the Orca path calls herdr.
 
+### One-off jobs run in Orca too
+
+Every other job, `uname -a` included, also gets its own Orca terminal rather
+than running as a hidden child of the poller. The poller writes the argv to
+`~/.config/issue-bridge/jobs/<issue>/job.json`, opens a terminal under the
+`bridge-jobs` workspace (`~/lanes/bridge-jobs`, adopted into Orca on first use)
+whose command is `bridge-poller.py --run-job <that directory>`, and waits for
+the tab to exit. The runner in the tab tees stdout and stderr to the tab and to
+files in the job directory and records the exit code there; the poller reads
+the files, not the tab, because Orca's own exit code and scrollback are not
+reliable once a tab has exited. The text typed into the tab's shell is fixed
+and names only the job directory, so nothing from the issue body reaches a
+shell. The tab is titled `#<issue> <title>`.
+
+Timeouts close the tab, which hangs up the PTY and everything under it; what
+the job printed up to then is kept. If the poller restarts mid-job, the job
+keeps running in its tab and the restarted poller waits for it and recovers the
+result from the job directory, never running the command twice.
+
+Config keys, both optional:
+
+- `"runner": "orca"` (default) or `"subprocess"`, the pre-Orca hidden child.
+  `ISSUE_BRIDGE_RUNNER=subprocess` overrides for one poller run. This is the
+  rollback switch.
+- `"orca_lane": "~/lanes/bridge-jobs"`, the workspace the job tabs live under.
+
+If Orca is not reachable (CLI missing, runtime down), the job runs hidden and
+its stderr ends with a line saying so, so the queue drains either way.
+`status.json` reports `runner` and, while a job runs, `running` with the issue
+number and terminal handle.
+
 ## Operating it
 
 - **Is it alive?** `cat ~/.config/issue-bridge/status.json` - rewritten around

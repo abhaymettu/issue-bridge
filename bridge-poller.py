@@ -10,10 +10,10 @@ no inbound port, no tunnel, no VPN.
 
 Protocol: AGENTS.md. Setup: README.md.
 """
-import calendar, json, os, pathlib, shlex, subprocess, sys, tempfile, time
+import calendar, json, os, pathlib, shlex, shutil, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HOME = pathlib.Path(os.environ.get("ISSUE_BRIDGE_HOME")
                     or pathlib.Path.home() / ".config/issue-bridge")
 CONFIG, TOKEN, STATUS = HOME / "config.json", HOME / "github-token", HOME / "status.json"
@@ -31,7 +31,8 @@ TIMEOUT = 900           # per-command wall clock
 
 _status = {"version": VERSION, "ts": 0, "last_poll_ok": None, "last_drain_ts": None,
            "queue_depth": 0, "last_error": None, "pat_expiry": None,
-           "pending_writebacks": [], "legacy_label_jobs": []}
+           "pending_writebacks": [], "legacy_label_jobs": [], "runner": None,
+           "running": None}
 
 
 def config():
@@ -39,6 +40,10 @@ def config():
     cfg.setdefault("label", "exec-job")
     cfg.setdefault("poll_interval", 60)
     cfg.setdefault("allow", [])
+    # "orca" runs each job in a visible Orca terminal; "subprocess" is the pre-Orca
+    # hidden child, kept as the rollback. ISSUE_BRIDGE_RUNNER overrides for one run.
+    cfg["runner"] = os.environ.get("ISSUE_BRIDGE_RUNNER") or cfg.get("runner") or "orca"
+    cfg.setdefault("orca_lane", "~/lanes/bridge-jobs")
     return cfg
 
 
@@ -145,6 +150,9 @@ def allowed(argv, allow):
 # --- running ------------------------------------------------------------
 
 def run(argv):
+    """The hidden runner: a child of the poller with its output on pipes. It is
+    the rollback (`"runner": "subprocess"`) and the fallback when Orca cannot be
+    reached, so the queue drains either way."""
     t0 = time.time()
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT)
@@ -166,6 +174,188 @@ def budget(out, err):
         return out, err
     err = clip(err, max(COMMENT_BUDGET // 4, COMMENT_BUDGET - len(out)))
     return clip(out, COMMENT_BUDGET - len(err)), err
+
+
+# --- visible runner: one Orca terminal per job ---------------------------
+# A job runs in a terminal tab Orca shows on its board, under a workspace of its
+# own (`orca_lane`), instead of as a hidden child of the poller. The tab runs
+# `bridge-poller.py --run-job <dir>`: a fixed command whose only variable is the
+# job directory, so the text typed into that shell never carries anything from
+# the issue. The runner tees the command's output to the tab and to files in the
+# directory and records the exit code there. The poller reads those files, not
+# Orca: Orca's own exit code and scrollback are not reliable once a tab has
+# exited, and the files survive a poller restart while the job keeps running.
+JOBS = HOME / "jobs"
+# launchd starts the poller with /usr/bin:/bin:/usr/sbin:/sbin; Orca is a brew tool.
+ORCA_PATH = os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin"
+
+
+def orca(cfg, *args, timeout=60):
+    """One `orca ... --json` call. The parsed `result`, or None when the CLI is
+    missing, fails, times out or answers ok:false. Callers treat None as "Orca
+    is not there right now", never as a verdict about the job."""
+    exe = shutil.which("orca", path=ORCA_PATH)
+    if not exe:
+        return None
+    try:
+        p = subprocess.run([exe, *args, "--json"], capture_output=True, text=True,
+                           timeout=timeout)
+        d = json.loads(p.stdout or "null")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    return d.get("result") if isinstance(d, dict) and d.get("ok") else None
+
+
+def job_lane(cfg):
+    """The Orca workspace the job tabs live under. Orca adopts a directory only if
+    it is a git repo; an empty init is enough, and adopting twice is a no-op."""
+    lane = pathlib.Path(os.path.expanduser(cfg["orca_lane"]))
+    try:
+        lane.mkdir(parents=True, exist_ok=True)
+        if not (lane / ".git").exists():
+            subprocess.run(["git", "init", "-q", str(lane)], capture_output=True,
+                           check=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return lane if orca(cfg, "repo", "add", "--path", str(lane)) else None
+
+
+def run_job(jobdir):
+    """`--run-job <dir>`: the process inside the Orca tab. Runs the argv in
+    job.json with stdin closed, tees each stream to the tab and to a file, and
+    writes exit.json last, so its presence means the record is complete."""
+    jobdir = pathlib.Path(jobdir)
+    job = json.loads((jobdir / "job.json").read_text())
+    argv = job["argv"]
+    print("issue-bridge job #%s\n$ %s\n" % (job["issue"], shlex.join(argv)), flush=True)
+    t0 = time.time()
+
+    def tee(src, path, mirror):
+        with open(path, "wb") as dst:
+            for chunk in iter(lambda: src.read1(65536), b""):
+                dst.write(chunk)
+                dst.flush()
+                mirror.write(chunk)
+                mirror.flush()
+
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+    except OSError as e:
+        (jobdir / "stdout").write_bytes(b"")
+        (jobdir / "stderr").write_text(str(e))
+        code = None
+        print("could not start: %s" % e, flush=True)
+    else:
+        threads = [threading.Thread(target=tee, args=(p.stdout, jobdir / "stdout", sys.stdout.buffer)),
+                   threading.Thread(target=tee, args=(p.stderr, jobdir / "stderr", sys.stderr.buffer))]
+        for t in threads:
+            t.start()
+        code = p.wait()
+        for t in threads:
+            t.join()
+    duration = round(time.time() - t0, 3)
+    tmp = jobdir / "exit.tmp"
+    tmp.write_text(json.dumps({"exit": code, "duration": duration, "ts": now()}))
+    tmp.replace(jobdir / "exit.json")
+    print("\nexit: %s  duration: %ss" % (code, duration), flush=True)
+    return 0 if code == 0 else 1
+
+
+def job_result(jobdir, note=None):
+    """The result as the runner left it. A missing exit.json reads as exit None,
+    which is how a killed or crashed job reports."""
+    def read(name):
+        try:
+            return (jobdir / name).read_bytes().decode("utf-8", "replace")
+        except OSError:
+            return ""
+    try:
+        meta = json.loads((jobdir / "exit.json").read_text())
+    except (OSError, ValueError):
+        meta = {}
+    err = read("stderr")
+    if note:
+        err = (err + "\n" if err else "") + "[issue-bridge] " + note
+    return {"exit": meta.get("exit"), "stdout": read("stdout"), "stderr": err,
+            "duration": meta.get("duration")}
+
+
+def hidden(argv, why):
+    r = run(argv)
+    r["stderr"] += ("\n" if r["stderr"] else "") + "[issue-bridge] ran as a hidden subprocess: " + why
+    return r
+
+
+def await_job(cfg, jobdir, handle, started):
+    """Wait for the tab to exit, then read the files. The wait is re-issued in
+    bounded slices so an Orca restart mid-job costs one slice, not the job. Past
+    TIMEOUT the tab is closed, which hangs up the PTY and everything the command
+    started under it; whatever it printed before that is kept."""
+    deadline = started + TIMEOUT
+    while True:
+        if (jobdir / "exit.json").exists():
+            return job_result(jobdir)
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        w = orca(cfg, "terminal", "wait", "--terminal", handle, "--for", "exit",
+                 "--timeout-ms", str(int(min(left, 60) * 1000)), timeout=min(left, 60) + 30)
+        if w is None:
+            show = orca(cfg, "terminal", "show", "--terminal", handle)
+            if show and show.get("terminal", {}).get("connected"):
+                time.sleep(5)
+                continue
+        elif not w.get("wait", {}).get("satisfied"):
+            continue
+        time.sleep(1)  # the runner writes exit.json before the PTY closes; give the fs a beat
+        return job_result(jobdir, None if (jobdir / "exit.json").exists() else
+                          "the Orca terminal ended without recording a result")
+    orca(cfg, "terminal", "close", "--terminal", handle, "--tab")
+    r = job_result(jobdir, "timeout after %ds; the Orca terminal was closed" % TIMEOUT)
+    r["exit"], r["duration"] = None, round(time.time() - started, 3)
+    return r
+
+
+def run_visible(cfg, issue, argv, rec):
+    """Run one job in its own visible Orca terminal. `rec` is the job's writeback
+    journal entry: the terminal handle and job directory go into it as soon as
+    they exist, so a restarted poller can find the tab instead of the label."""
+    n = issue["number"]
+    lane = job_lane(cfg)
+    if lane is None:
+        return hidden(argv, "Orca is not reachable (orca CLI missing, runtime down, or the job lane could not be adopted)")
+    jobdir = JOBS / str(n)
+    jobdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for name in ("stdout", "stderr", "exit.json"):
+        (jobdir / name).unlink(missing_ok=True)
+    started = time.time()
+    (jobdir / "job.json").write_text(json.dumps({"issue": n, "argv": argv}))
+    cmd = "exec " + shlex.join([sys.executable, str(pathlib.Path(__file__).resolve()),
+                                "--run-job", str(jobdir)])
+    title = ("#%d %s" % (n, issue.get("title") or ""))[:60]
+    res = orca(cfg, "terminal", "create", "--worktree", "path:%s" % lane,
+               "--title", title, "--command", cmd)
+    handle = ((res or {}).get("terminal") or {}).get("handle")
+    if not handle:
+        return hidden(argv, "orca terminal create failed")
+    rec.update({"jobdir": str(jobdir), "terminal": handle, "started": started})
+    save_pending(rec)
+    _status["running"] = {"issue": n, "terminal": handle, "lane": str(lane),
+                          "started_at": now(), "title": title}
+    write_status()
+    try:
+        return await_job(cfg, jobdir, handle, started)
+    finally:
+        _status["running"] = None
+
+
+def resume_job(cfg, rec):
+    """A journal entry that names a terminal: the poller restarted while that job
+    ran in Orca. Wait for it if it is still running, recover its result from the
+    job directory, and never run the command again."""
+    return await_job(cfg, pathlib.Path(rec["jobdir"]), rec["terminal"],
+                     rec.get("started") or time.time())
 
 
 
@@ -304,8 +494,14 @@ def drain_pending(cfg):
     """Retry unfinished writebacks from earlier cycles. These issues have already
     lost the label, so the poll query never returns them again."""
     for _, rec in list(iter_pending()):
-        if rec:
-            writeback(cfg, rec)
+        if not rec:
+            continue
+        if rec.get("jobdir"):  # the pre-run record of a job that ran in Orca
+            # body=None: the original issue body is not at hand, and a PATCH without it
+            # would drop it; the comment carries the result.
+            rec = dict(result_record(cfg, {"number": rec["issue"]}, resume_job(cfg, rec)), body=None)
+            save_pending(rec)
+        writeback(cfg, rec)
 # --- end local deployment patch ---
 
 
@@ -358,26 +554,36 @@ def handle(cfg, issue):
         relabel(cfg, n, None)
         # Journal before running. If the poller dies mid-command the next cycle
         # finds this entry, says so on the issue, and does not run it again.
-        save_pending({"issue": n, "done": False, "body": None, "steps": {},
-                      "attempts": 0, "created": now(), "argv": shlex.join(argv),
-                      "comment": "**result lost** - the poller stopped between starting "
-                                 "`%s` and recording its output. The command may have run; "
-                                 "it will not be run again. Refile if you still need it.\n"
-                                 % clip(shlex.join(argv), 200)})
-        r = run(argv)
-        out, err = budget(r["stdout"], r["stderr"])
-        done = r["exit"] == 0
-        body = ("exit: `%s`  duration: `%ss`\n\n**stdout**\n```\n%s\n```\n"
-                "**stderr**\n```\n%s\n```\n" % (r["exit"], r["duration"], out, err))
+        pre = {"issue": n, "done": False, "body": None, "steps": {},
+               "attempts": 0, "created": now(), "argv": shlex.join(argv),
+               "comment": "**result lost** - the poller stopped between starting "
+                          "`%s` and recording its output. The command may have run; "
+                          "it will not be run again. Refile if you still need it.\n"
+                          % clip(shlex.join(argv), 200)}
+        save_pending(pre)
+        r = run_visible(cfg, issue, argv, pre) if cfg.get("runner") == "orca" else run(argv)
+        rec = result_record(cfg, issue, r, legacy_note(cfg, issue))
+        save_pending(rec)
+        return writeback(cfg, rec)
 
     # --- local deployment patch: journalled writeback (not upstream)
     # denied, unparseable and stale jobs never ran, so they carry no result block
-    body = legacy_note(cfg, issue) + body
-    rec = {"issue": n, "done": done, "comment": body, "steps": {}, "attempts": 0,
-           "created": now(), "body": _rb_body(issue.get("body") or "", r) if r else None}
+    rec = {"issue": n, "done": done, "comment": legacy_note(cfg, issue) + body,
+           "steps": {}, "attempts": 0, "created": now(), "body": None}
     save_pending(rec)
     return writeback(cfg, rec)
     # --- end local deployment patch ---
+
+
+def result_record(cfg, issue, r, note=""):
+    """The journal entry for a job that ran: the comment, the body result block,
+    and the label to close under."""
+    out, err = budget(r["stdout"], r["stderr"])
+    body = ("exit: `%s`  duration: `%ss`\n\n**stdout**\n```\n%s\n```\n"
+            "**stderr**\n```\n%s\n```\n" % (r["exit"], r["duration"], out, err))
+    return {"issue": issue["number"], "done": r["exit"] == 0, "comment": note + body,
+            "steps": {}, "attempts": 0, "created": now(),
+            "body": _rb_body(issue.get("body") or "", r)}
 
 
 # --- loop ---------------------------------------------------------------
@@ -427,6 +633,7 @@ def poll(cfg):
 
 
 def cycle(cfg):
+    _status["runner"] = cfg.get("runner")
     drain_pending(cfg)  # unfinished writebacks first: their issues lost the label
     _status["pending_writebacks"] = pending_status()
     try:
@@ -601,6 +808,74 @@ def self_test():
         finally:
             globals()["gh"], globals()["run"] = real_gh, real_run
 
+    # --- visible runner: the tab-side runner, its result files, and the fallbacks ---
+    with tempfile.TemporaryDirectory() as d:
+        jobdir = pathlib.Path(d) / "jobs" / "7"
+        jobdir.mkdir(parents=True)
+        jobdir.joinpath("job.json").write_text(json.dumps({"issue": 7, "argv": [
+            sys.executable, "-c", "import sys; print('vis-out'); print('vis-err', file=sys.stderr); sys.exit(4)"]}))
+        p = subprocess.run([sys.executable, __file__, "--run-job", str(jobdir)],
+                           capture_output=True, text=True, timeout=60)
+        r = job_result(jobdir)
+        check("run-job records the exit code", r["exit"] == 4)
+        check("run-job records stdout", r["stdout"].strip() == "vis-out")
+        check("run-job records stderr", r["stderr"].strip() == "vis-err")
+        check("run-job mirrors output to the tab", "vis-out" in p.stdout and "vis-err" in p.stderr)
+        check("run-job names the job in the tab", "job #7" in p.stdout)
+        check("missing exit.json reads as exit None",
+              job_result(pathlib.Path(d) / "nope")["exit"] is None)
+        check("job_result appends the note to stderr",
+              job_result(jobdir, "why")["stderr"].endswith("[issue-bridge] why"))
+
+        # no orca binary: the job still runs, hidden, and the result says so
+        real_jobs, real_path = JOBS, ORCA_PATH
+        globals()["JOBS"], globals()["ORCA_PATH"] = pathlib.Path(d) / "jobs2", "/nonexistent"
+        cfg_v = {"repo": "x/y", "label": "exec-job", "allow": ["uname"], "runner": "orca",
+                 "orca_lane": str(pathlib.Path(d) / "lane")}
+        r = run_visible(cfg_v, {"number": 8, "title": "t"}, [sys.executable, "-c", "print('fb')"], {"issue": 8})
+        check("fallback runs the command when orca is missing", r["exit"] == 0 and r["stdout"].strip() == "fb")
+        check("fallback says it ran hidden", "ran as a hidden subprocess" in r["stderr"])
+
+        # timeout: a fake orca that never reports exit -> the tab is closed, partial output kept
+        real_orca, real_timeout = orca, TIMEOUT
+        calls = []
+
+        def fake_orca(cfg, *args, timeout=60):
+            calls.append(args[:2])
+            if args[:2] == ("repo", "add"):
+                return {"repo": {}}
+            if args[:2] == ("terminal", "create"):
+                jd = pathlib.Path(args[args.index("--command") + 1].split("--run-job ")[1])
+                jd.joinpath("stdout").write_text("partial")
+                return {"terminal": {"handle": "term_fake"}}
+            if args[:2] == ("terminal", "wait"):
+                time.sleep(0.05)
+                return {"wait": {"satisfied": False}}
+            if args[:2] == ("terminal", "close"):
+                return {}
+            return None
+
+        globals()["orca"], globals()["TIMEOUT"], globals()["ORCA_PATH"] = fake_orca, 0.2, real_path
+        try:
+            rec = {"issue": 9}
+            r = run_visible(cfg_v, {"number": 9, "title": "slow"}, ["sleep", "5"], rec)
+            check("timeout closes the orca tab", ("terminal", "close") in calls)
+            check("timeout reports exit None", r["exit"] is None and "timeout" in r["stderr"])
+            check("timeout keeps partial output", r["stdout"] == "partial")
+            check("journal learns the terminal before the run ends",
+                  rec.get("terminal") == "term_fake" and rec.get("jobdir"))
+            check("command never typed into the tab shell",
+                  all("sleep" not in " ".join(c) for c in calls))
+            # resume after a poller restart: exit.json present -> recovered, never re-run
+            jd = pathlib.Path(rec["jobdir"])
+            jd.joinpath("exit.json").write_text(json.dumps({"exit": 0, "duration": 1.5}))
+            jd.joinpath("stdout").write_text("done-out")
+            r = resume_job(cfg_v, rec)
+            check("resume recovers the recorded result", r and r["exit"] == 0 and r["stdout"] == "done-out")
+        finally:
+            globals()["orca"], globals()["TIMEOUT"] = real_orca, real_timeout
+            globals()["JOBS"] = real_jobs
+
     for name, ok in results:
         print("%-42s %s" % (name, "PASS" if ok else "FAIL"))
     bad = sum(1 for _, ok in results if not ok)
@@ -611,6 +886,8 @@ def self_test():
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         sys.exit(self_test())
+    if "--run-job" in sys.argv:
+        sys.exit(run_job(sys.argv[sys.argv.index("--run-job") + 1]))
     once = "--once" in sys.argv
     while True:
         try:
