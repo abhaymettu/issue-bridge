@@ -18,12 +18,20 @@ HOME = pathlib.Path(os.environ.get("ISSUE_BRIDGE_HOME")
                     or pathlib.Path.home() / ".config/issue-bridge")
 CONFIG, TOKEN, STATUS = HOME / "config.json", HOME / "github-token", HOME / "status.json"
 API = "https://api.github.com/repos/"
+# Labels this bridge was filed under before the rename. Agents, saved snippets and old
+# runbooks still use them, and an issue carrying only the old label used to sit open
+# forever with nobody saying why. Fixed table, mapped to the label it was renamed to:
+# it is deliberately not read from config, because the label is the one place
+# instructions enter this machine (TRUST-BOUNDARY.md) and widening it by configuration
+# would widen that.
+LEGACY_LABELS = {"am-exec": "exec-job"}
+CONTROL_SUBCOMMAND = "control"   # argv[1] of a job that may jump the queue
 COMMENT_BUDGET = 58000  # GitHub caps a single comment at 65536 chars
 TIMEOUT = 900           # per-command wall clock
 
 _status = {"version": VERSION, "ts": 0, "last_poll_ok": None, "last_drain_ts": None,
            "queue_depth": 0, "last_error": None, "pat_expiry": None,
-           "pending_writebacks": []}
+           "pending_writebacks": [], "legacy_label_jobs": []}
 
 
 def config():
@@ -71,12 +79,21 @@ def gh(cfg, method, path, body=None):
         return json.loads(r.read() or b"null")
 
 
+def legacy_aliases(cfg):
+    """Old labels that mean this lane's label. Empty unless the lane runs under the
+    default, so a lane with a custom label never inherits another lane's old queue."""
+    return [old for old, new in LEGACY_LABELS.items() if new == cfg["label"]]
+
+
 def relabel(cfg, n, add):
-    try:
-        gh(cfg, "DELETE", "/issues/%d/labels/%s" % (n, urllib.parse.quote(cfg["label"])))
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            raise
+    # Every label that could re-queue this issue comes off, aliases included: the label is
+    # dropped before the command runs, and one left behind means a second execution.
+    for label in [cfg["label"]] + legacy_aliases(cfg):
+        try:
+            gh(cfg, "DELETE", "/issues/%d/labels/%s" % (n, urllib.parse.quote(label)))
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
     if add:
         gh(cfg, "POST", "/issues/%d/labels" % n, {"labels": [add]})
 
@@ -292,6 +309,16 @@ def drain_pending(cfg):
 # --- end local deployment patch ---
 
 
+def legacy_note(cfg, issue):
+    """The warning the filer actually reads. Says it ran, and what to file next time."""
+    old = issue.get("legacy_label")
+    if not old:
+        return ""
+    return ("> **legacy label.** This was filed as `%s`, renamed to `%s`. It was handled "
+            "anyway and the old label has been removed. File the next one with `%s`.\n\n"
+            % (old, cfg["label"], cfg["label"]))
+
+
 def handle(cfg, issue):
     n = issue["number"]
     rec = load_pending(n)
@@ -345,6 +372,7 @@ def handle(cfg, issue):
 
     # --- local deployment patch: journalled writeback (not upstream)
     # denied, unparseable and stale jobs never ran, so they carry no result block
+    body = legacy_note(cfg, issue) + body
     rec = {"issue": n, "done": done, "comment": body, "steps": {}, "attempts": 0,
            "created": now(), "body": _rb_body(issue.get("body") or "", r) if r else None}
     save_pending(rec)
@@ -354,13 +382,55 @@ def handle(cfg, issue):
 
 # --- loop ---------------------------------------------------------------
 
+def is_control(issue):
+    """Parsing only; nothing here runs or writes. A malformed body is not control."""
+    try:
+        argv = json.loads(parse(issue.get("body")).get("argv", "null"))
+    except ValueError:
+        return False
+    return isinstance(argv, list) and len(argv) > 1 and argv[1] == CONTROL_SUBCOMMAND
+
+
+def control_first(issues):
+    """Control jobs (`lane control mute ...`) jump the queue; everything else keeps its
+    oldest-first order, because sorted() is stable.
+
+    The queue is serial and a lane prompt can hold it for the full 900s timeout. A mute
+    that arrives behind one is useless by the time it runs. Order is not a permission:
+    a control job still goes through allowed() like any other, and the wrapper accepts a
+    closed set of control words with fixed text.
+    """
+    return sorted(issues, key=lambda i: 0 if is_control(i) else 1)
+
+
+def poll(cfg):
+    """Open jobs for this lane, oldest first, including any filed under a legacy label.
+
+    A legacy-labelled issue is warned about (on the issue, in the log and in status.json)
+    and then run as if it carried the current label, rather than sitting open forever
+    because nothing was listening on the name the filer used.
+    """
+    seen, issues = set(), []
+    labels = [cfg["label"]] + legacy_aliases(cfg)
+    for label in labels:
+        got = gh(cfg, "GET", "/issues?state=open&labels=%s&sort=created"
+                             "&direction=asc&per_page=30" % urllib.parse.quote(label)) or []
+        for i in got:
+            if "pull_request" in i or i["number"] in seen:
+                continue
+            seen.add(i["number"])
+            if label != cfg["label"]:
+                i["legacy_label"] = label
+            issues.append(i)
+    issues.sort(key=lambda i: i.get("created_at") or "")
+    return issues
+
+
 def cycle(cfg):
     drain_pending(cfg)  # unfinished writebacks first: their issues lost the label
     _status["pending_writebacks"] = pending_status()
-    q = urllib.parse.quote(cfg["label"])
     try:
-        issues = gh(cfg, "GET", "/issues?state=open&labels=%s&sort=created"
-                                "&direction=asc&per_page=30" % q)
+        issues = poll(cfg)
         _status["last_poll_ok"], _status["last_error"] = time.time(), None
     except (urllib.error.HTTPError, OSError) as e:
         # Transient by construction: the issues keep their label and the next
@@ -369,10 +439,14 @@ def cycle(cfg):
         _status["last_error"] = "poll: %s" % e
         return write_status()
 
-    issues = [i for i in (issues or []) if "pull_request" not in i]
     _status["queue_depth"] = len(issues)
+    _status["legacy_label_jobs"] = [{"issue": i["number"], "label": i["legacy_label"]}
+                                    for i in issues if i.get("legacy_label")]
+    for i in _status["legacy_label_jobs"]:
+        print("issue #%d carries the legacy label %r; running it as %r. Refile future jobs "
+              "with %r." % (i["issue"], i["label"], cfg["label"], cfg["label"]), flush=True)
     write_status()
-    for issue in issues:
+    for issue in control_first(issues):
         try:
             handle(cfg, issue)
             _status["last_drain_ts"] = time.time()
@@ -415,6 +489,27 @@ def self_test():
     check("no ttl never stale", not stale({"queued_at": "2000-01-01T00:00:00Z"}, "alert"))
     check("bad queued_at not stale", not stale({"ttl": "1", "queued_at": "nonsense"}, "alert"))
 
+    cfg_default = {"repo": "x/y", "label": "exec-job", "allow": []}
+    check("legacy alias maps to the default label",
+          legacy_aliases(cfg_default) == ["am-exec"])
+    check("a custom label inherits no alias",
+          legacy_aliases({"repo": "x/y", "label": "my-lane", "allow": []}) == [])
+    check("legacy note names both labels",
+          "am-exec" in legacy_note(cfg_default, {"legacy_label": "am-exec"})
+          and "exec-job" in legacy_note(cfg_default, {"legacy_label": "am-exec"}))
+    check("no note without a legacy label", legacy_note(cfg_default, {}) == "")
+
+    ctl = {"number": 2, "body": '---\nargv: ["/x/lane", "control", "mute", "j", "a"]\n---\n'}
+    work = {"number": 1, "body": '---\nargv: ["/x/lane", "prompt", "a", "j", "hi"]\n---\n'}
+    work2 = {"number": 3, "body": '---\nargv: ["uname", "-a"]\n---\n'}
+    check("control job is recognised", is_control(ctl))
+    check("prompt job is not control", not is_control(work))
+    check("unparseable job is not control", not is_control({"number": 4, "body": "junk"}))
+    check("control jumps the queue",
+          [i["number"] for i in control_first([work, ctl, work2])] == [2, 1, 3])
+    check("work order is otherwise untouched",
+          [i["number"] for i in control_first([work, work2])] == [1, 3])
+
     out, err = budget("x" * 60000, "y" * 60000)
     check("comment budget", len(out) + len(err) < 65536)
     check("short output untouched", budget("a", "b") == ("a", "b"))
@@ -442,6 +537,8 @@ def self_test():
 
         def fake_gh(cfg, method, path, body=None):
             calls.append((method, path))
+            if method == "POST" and path.endswith("/comments"):
+                state.setdefault("comments", []).append(body["body"])
             if method == "PATCH" and body and "body" in body:
                 if fail["body_patch"]:
                     raise OSError("simulated body PATCH failure")
@@ -488,6 +585,19 @@ def self_test():
                          "body": '---\nargv: ["rm", "-rf", "/"]\nrule: drain-on-wake\n---\n'})
             check("denied job does not run", len(runs) == 1)
             check("denied job leaves no journal", load_pending(12) is None)
+
+            # a job filed under the legacy label: runs, warns, and loses both labels
+            del calls[:]
+            handle(cfg, {"number": 13, "legacy_label": "am-exec",
+                         "body": '---\nargv: ["uname", "-m"]\nrule: drain-on-wake\n---\n'})
+            deletes = [c[1] for c in calls if c[0] == "DELETE"]
+            check("legacy job runs", len(runs) == 2)
+            check("legacy label is removed too",
+                  any(d.endswith("/labels/am-exec") for d in deletes)
+                  and any(d.endswith("/labels/exec-job") for d in deletes))
+            check("legacy job is warned about on the issue",
+                  "legacy label" in state["comments"][-1]
+                  and "am-exec" in state["comments"][-1])
         finally:
             globals()["gh"], globals()["run"] = real_gh, real_run
 

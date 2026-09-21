@@ -73,6 +73,28 @@ forever and nobody tells you. If you create the issue and add the label in a
 second call, check that the second call succeeded. Most "the bridge is broken"
 reports are a missing label.
 
+One old name is still answered: an issue labelled `am-exec`, the name `exec-job`
+replaced, is handled as if it carried `exec-job`. The reply says so and both
+labels come off. That is the whole list of aliases -- it is fixed in the poller,
+not configurable -- so any other label is still invisible. Use `exec-job`.
+
+### Control jobs jump the queue
+
+The queue is serial and one job can hold it for the full 900-second timeout. A
+job whose `argv` is the lane wrapper with `control` as its second token runs
+before the queued work rather than behind it:
+
+```
+---
+argv: ["/absolute/path/lane", "control", "mute", "<issue-number>", "alpha", "bravo"]
+---
+```
+
+The control words are a closed set (`mute`, `unmute`) whose text the wrapper
+owns; you cannot pass prose through `control`, and every named lane is reached
+at once. Jumping the queue is not permission: a control job goes through the
+same allowlist as everything else.
+
 ## Scheduling fields, if the job is time-sensitive
 
 Omitted, `rule` is `drain-on-wake`: the job runs whenever the poller next
