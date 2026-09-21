@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # lane - the mac-lane wrapper: the one allowlisted path for lane work.
 #
-# One named task gets one tmux session (the spine) attached into one herdr
-# workspace tab (the viewer), running an interactive Claude Code session.
+# One named task gets one Orca worktree and one visible Orca terminal running
+# an interactive Claude Code session. The lane is a thing you can point at on
+# the Orca board, not a hidden process: `orca terminal list` shows it, the
+# desktop app shows its tab, and every prompt lands in that tab.
+#
 # Subcommands cover the whole lane lifecycle: health, up, prompt, read, list,
-# stop, control. There is deliberately no way to reach bash/sh/python/ssh/tmux/herdr
+# stop, control. There is deliberately no way to reach bash/sh/python/ssh/tmux
 # through this script: every external call below is a fixed binary with
 # validated arguments, so an allowlist entry for this path admits lane
 # operations and nothing else.
@@ -14,9 +17,15 @@
 # job with the same id prints the recorded entry and exits without
 # re-sending, so a refiled issue cannot duplicate the work.
 #
+# Rollback: the pre-Orca tmux+herdr backend is preserved verbatim as
+# `lane-herdr` beside this file. `ISSUE_BRIDGE_LANE_BACKEND=herdr lane ...`
+# hands the whole invocation to it. Nothing about herdr is on the Orca path.
+#
 # Layout:
 #   ~/.config/issue-bridge/lanes/<name>/state      active | archived
-#   ~/.config/issue-bridge/lanes/<name>/workspace  herdr workspace id
+#   ~/.config/issue-bridge/lanes/<name>/terminal   Orca terminal handle
+#   ~/.config/issue-bridge/lanes/<name>/worktree   Orca worktree path
+#   ~/.config/issue-bridge/lanes/<name>/workspace  legacy herdr id (rollback only)
 #   ~/.config/issue-bridge/lanes/<name>/jobs/<id>  one record per prompt job
 #   ~/lanes/<name>/                                the lane's working directory
 set -euo pipefail
@@ -26,10 +35,22 @@ set -euo pipefail
 PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 export PATH
 
+# Rollback switch, checked before anything else so a broken Orca path cannot
+# stop the fallback from running.
+if [ "${ISSUE_BRIDGE_LANE_BACKEND:-orca}" = herdr ]; then
+  exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lane-herdr" "$@"
+fi
+
 CONF="${ISSUE_BRIDGE_HOME:-$HOME/.config/issue-bridge}"
 REGISTRY="$CONF/lanes"
 LANES_ROOT="${ISSUE_BRIDGE_LANES_ROOT:-$HOME/lanes}"
-CLAUDE_BIN="${ISSUE_BRIDGE_LANE_CLAUDE:-claude}"
+ORCA_BIN="${ISSUE_BRIDGE_LANE_ORCA:-orca}"
+# One agent command, fixed here rather than taken from the caller: an
+# allowlist entry for this script must not become an allowlist entry for
+# arbitrary argv. Sonnet, not Fable: lane jobs are bounded workers.
+CLAUDE_ARGV=(claude --model sonnet)
+BOOT_TIMEOUT_MS=90000
+SUBMIT_WAIT_S=20
 MAX_PROMPT=12000
 MAX_READ=500
 
@@ -37,18 +58,11 @@ err()  { printf '%s\n' "$*" >&2; }
 die()  { err "lane: $*"; exit 1; }
 usage() { err "usage: $2"; exit "$1"; }
 
-# Lane names double as tmux session names and herdr labels. This charset is
-# safe in both (no ':' '.' '%', which tmux target syntax treats specially)
-# and forces the plain-language lowercase style he asked for.
+# Lane names double as Orca worktree directory names and terminal titles.
+# This charset is safe as a path component and forces the plain-language
+# lowercase style he asked for.
 valid_name() { [[ "$1" =~ ^[a-z][a-z0-9-]{0,30}$ ]]; }
 valid_job()  { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
-
-session_of() { printf 'lane-%s' "$1"; }
-
-have_session() { tmux has-session -t "$1" 2>/dev/null; }
-
-# What the lane's pane is running right now: claude, node, zsh, ...
-pane_cmd() { tmux display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null || true; }
 
 LANE_LOCK=""
 try_lock_lane() { # <lane dir> [attempts] - never fatal; 3 attempts is "only if it is free"
@@ -71,59 +85,61 @@ lock_lane() {
   try_lock_lane "$1" 50 || die "another lane operation is holding $1"
 }
 
-agent_running() {
-  case "$(pane_cmd "$1")" in
-    claude|node|[0-9]*.[0-9]*.[0-9]*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+# --- Orca ----------------------------------------------------------------
+# Every call goes through `orca ... --json` and is read with python3, so a
+# change in Orca's human-readable output cannot silently change a decision.
 
-shell_waiting() {
-  case "$(pane_cmd "$1")" in
-    zsh|bash|sh|fish) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# --- herdr (viewer only; every failure here is a warning, never fatal) -----
-
-herdr_ok() { command -v herdr >/dev/null 2>&1 && herdr status >/dev/null 2>&1; }
-
-json_field() { # json_field <dotted.path> - read one field from JSON on stdin
+# jfield <dotted.path> - read one field from JSON on stdin, empty if absent
+jfield() {
   python3 -c 'import json,sys
-d = json.load(sys.stdin)
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
 for part in sys.argv[1].split("."):
+    if not isinstance(d, dict) or part not in d:
+        sys.exit(0)
     d = d[part]
-print(d)' "$1" 2>/dev/null
+print(d if not isinstance(d, (dict, list)) else json.dumps(d))' "$1" 2>/dev/null
 }
 
-herdr_ensure_workspace() { # <name> <dir> <session> -> prints id or nothing
-  local name="$1" dir="$2" session="$3" wid pane out
-  herdr_ok || { err "lane: warn: herdr unavailable; lane works in tmux but is not on the board"; return 0; }
-  if [ -s "$REGISTRY/$name/workspace" ]; then
-    wid="$(cat "$REGISTRY/$name/workspace")"
-    if herdr workspace get "$wid" >/dev/null 2>&1; then
-      printf '%s' "$wid"
-      return 0
-    fi
-  fi
-  out="$(herdr workspace create --cwd "$dir" --label "$name" --no-focus 2>/dev/null)" || {
-    err "lane: warn: herdr workspace create failed; lane works in tmux but is not on the board"
-    return 0
-  }
-  wid="$(printf '%s' "$out" | json_field result.workspace.workspace_id)"
-  pane="$(printf '%s' "$out" | json_field result.root_pane.pane_id)"
-  [ -n "$wid" ] && [ -n "$pane" ] || {
-    err "lane: warn: could not parse herdr workspace response; lane works in tmux but is not on the board"
-    return 0
-  }
-  # The tab runs a tmux client, so the pane shows the live interactive
-  # Claude UI while every keystroke still goes through tmux, never through
-  # herdr's write path.
-  herdr pane run "$pane" "exec tmux attach -t $session" >/dev/null 2>&1 || \
-    err "lane: warn: herdr tab could not attach $session; attach by hand with: tmux attach -t $session"
-  printf '%s' "$wid" > "$REGISTRY/$name/workspace"
-  printf '%s' "$wid"
+orca_ok() { command -v "$ORCA_BIN" >/dev/null 2>&1; }
+
+orca_ready() { # runtime reachable and in the ready state
+  [ "$("$ORCA_BIN" status --json 2>/dev/null | jfield result.runtime.state)" = ready ]
+}
+
+terminal_live() { # <handle> - true if Orca still owns a running terminal by that handle
+  [ -n "$1" ] || return 1
+  # `connected` is the runtime's own liveness bit and `orphaned` is its
+  # "I lost the process" bit. Both, because a terminal Orca still lists but
+  # has orphaned cannot take a prompt.
+  local out
+  out="$("$ORCA_BIN" terminal show --terminal "$1" --json 2>/dev/null)"
+  [ "$(printf '%s' "$out" | jfield result.terminal.connected)" = True ] &&
+  [ "$(printf '%s' "$out" | jfield result.terminal.orphaned)" != True ]
+}
+
+# Claude asks a trust question the first time it opens a directory, and that
+# question eats the first prompt sent to the lane. Seeding the answer for the
+# lane's own directory is the deterministic fix; screen-scraping the dialog is
+# not. Only ever adds the key, never removes or rewrites anything else.
+seed_trust() { # <dir>
+  python3 -c 'import json,os,sys,tempfile
+path = os.path.expanduser("~/.claude.json")
+target = sys.argv[1]
+try:
+    d = json.load(open(path))
+except (OSError, ValueError):
+    sys.exit(0)
+e = d.setdefault("projects", {}).setdefault(target, {})
+if e.get("hasTrustDialogAccepted") is True:
+    sys.exit(0)
+e["hasTrustDialogAccepted"] = True
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=2)
+os.replace(tmp, path)' "$1" 2>/dev/null || true
 }
 
 # --- subcommands -----------------------------------------------------------
@@ -146,19 +162,18 @@ print("yes" if sys.argv[1] in json.load(open(sys.argv[2])).get("allow", []) else
     fails=1
   fi
 
-  if command -v tmux >/dev/null 2>&1; then
-    local n
-    n="$(tmux ls -F '#{session_name}' 2>/dev/null | grep -c '^lane-' || true)"
-    echo "ok    tmux: present, $n lane session(s)"
-  else
-    echo "FAIL  tmux: not on PATH (/opt/homebrew/bin or /usr/local/bin)"
+  if ! orca_ok; then
+    echo "FAIL  orca: not on PATH (/opt/homebrew/bin or /usr/local/bin)"
     fails=1
-  fi
-
-  if herdr_ok; then
-    echo "ok    herdr: present, server answering"
+  elif orca_ready; then
+    local n
+    n="$("$ORCA_BIN" terminal list --json 2>/dev/null | python3 -c 'import json,sys
+try: print(len(json.load(sys.stdin)["result"]["terminals"]))
+except Exception: print(0)')"
+    echo "ok    orca: runtime ready, $n live terminal(s)"
   else
-    echo "warn  herdr: unavailable - lanes still work in tmux, but will not show on the board"
+    echo "FAIL  orca: runtime not ready - check: orca status --json"
+    fails=1
   fi
 
   if [ -f "$CONF/status.json" ]; then
@@ -174,6 +189,12 @@ sys.exit(0 if t and time.time() - t < 300 else 1)' "$CONF/status.json" 2>/dev/nu
     echo "warn  poller: $CONF/status.json missing - poller has not written status yet"
   fi
 
+  if [ -x "$(dirname "$wrapper_cfg")/lane-herdr" ]; then
+    echo "ok    rollback: lane-herdr present (ISSUE_BRIDGE_LANE_BACKEND=herdr), not on the execution path"
+  else
+    echo "warn  rollback: lane-herdr missing beside this script"
+  fi
+
   if [ "$fails" -eq 0 ]; then
     echo "LANE HEALTH: OK"
   else
@@ -184,61 +205,64 @@ sys.exit(0 if t and time.time() - t < 300 else 1)' "$CONF/status.json" 2>/dev/nu
 
 cmd_up() { # <name>
   [ $# -eq 1 ] || usage 2 "lane up <name>"
-  local name="$1" session dir wid launched
+  local name="$1" dir handle launched title out
   valid_name "$name" || usage 2 "lane up <name> - name must match [a-z][a-z0-9-]{0,30}"
-  command -v tmux >/dev/null 2>&1 || die "tmux not found on PATH"
+  orca_ok || die "orca not found on PATH"
+  orca_ready || die "orca runtime is not ready - check: orca status --json"
 
-  session="$(session_of "$name")"
   dir="$LANES_ROOT/$name"
+  title="lane: $name"
   mkdir -p "$REGISTRY/$name/jobs" "$dir"
   lock_lane "$REGISTRY/$name"
 
-  if [ -f "$REGISTRY/$name/state" ] && [ "$(cat "$REGISTRY/$name/state")" = active ] \
-     && have_session "$session"; then
-    echo "resumed: $name (tmux session $session already alive)"
-  else
-    # Ledger BEFORE effects: a retried `up` sees this record and takes the
-    # resume path instead of making a second workspace.
-    printf 'active\n' > "$REGISTRY/$name/state"
-    if have_session "$session"; then
-      echo "resumed: $name (adopted existing tmux session $session)"
-    else
-      tmux new-session -d -s "$session" -c "$dir" -x 220 -y 50
-      echo "created: $name (tmux session $session, cwd $dir)"
-    fi
-  fi
+  # A lane directory has to be a git repo for Orca to adopt it as a worktree.
+  # An empty init is enough; no commit is required.
+  [ -d "$dir/.git" ] || git init -q "$dir"
+  "$ORCA_BIN" repo add --path "$dir" --json >/dev/null 2>&1 ||
+    die "orca could not adopt $dir as a repo"
+  printf '%s' "$dir" > "$REGISTRY/$name/worktree"
+  seed_trust "$dir"
 
-  # Self-healing resume: a pane sitting at a shell (fresh session, or claude
-  # exited, or the Mac rebooted and the session was recreated) gets claude
-  # back. --continue picks the lane's conversation back up in the same cwd;
-  # the jobs ledger marks whether this lane ever launched one.
-  launched=no
-  [ -f "$REGISTRY/$name/jobs/.launched" ] && launched=yes
-  if shell_waiting "$session"; then
+  # Ledger BEFORE effects: a retried `up` sees this record and takes the
+  # resume path instead of making a second terminal.
+  printf 'active\n' > "$REGISTRY/$name/state"
+
+  handle="$(cat "$REGISTRY/$name/terminal" 2>/dev/null || true)"
+  if terminal_live "$handle"; then
+    echo "resumed: $name (orca terminal $handle already live)"
+  else
+    launched=no
+    [ -f "$REGISTRY/$name/jobs/.launched" ] && launched=yes
+    # --continue picks the lane's conversation back up in the same cwd; the
+    # jobs ledger marks whether this lane ever launched one.
     if [ "$launched" = yes ]; then
-      tmux send-keys -t "$session" -- "$CLAUDE_BIN --continue" Enter
-      echo "agent: relaunched '$CLAUDE_BIN --continue' in $session"
+      out="$("$ORCA_BIN" terminal create --worktree "path:$dir" --title "$title" \
+             --command "${CLAUDE_ARGV[*]} --continue" --json 2>/dev/null)"
     else
-      tmux send-keys -t "$session" -- "$CLAUDE_BIN" Enter
-      date +%s > "$REGISTRY/$name/jobs/.launched"
-      echo "agent: started '$CLAUDE_BIN' in $session"
+      out="$("$ORCA_BIN" terminal create --worktree "path:$dir" --title "$title" \
+             --command "${CLAUDE_ARGV[*]}" --json 2>/dev/null)"
     fi
-  elif agent_running "$session"; then
-    echo "agent: already running in $session"
-  else
-    echo "warn: pane is running '$(pane_cmd "$session")', not a shell or claude - left untouched"
+    handle="$(printf '%s' "$out" | jfield result.terminal.handle)"
+    [ -n "$handle" ] || die "orca terminal create returned no handle for $name"
+    printf '%s' "$handle" > "$REGISTRY/$name/terminal"
+    date +%s > "$REGISTRY/$name/jobs/.launched"
+    # Orca retitles an agent tab from the agent itself, so the lane name has
+    # to be set after the fact for the tab to be findable by lane name.
+    "$ORCA_BIN" terminal rename --terminal "$handle" --title "$title" --json >/dev/null 2>&1 || true
+    echo "created: $name (orca terminal $handle, cwd $dir, agent ${CLAUDE_ARGV[*]})"
+    # The agent has to finish booting before a prompt can land in it.
+    "$ORCA_BIN" terminal wait --terminal "$handle" --for tui-idle \
+       --timeout-ms "$BOOT_TIMEOUT_MS" --json >/dev/null 2>&1 ||
+       err "lane: warn: $name did not reach idle in ${BOOT_TIMEOUT_MS}ms - inspect with: lane read $name"
   fi
 
-  wid="$(herdr_ensure_workspace "$name" "$dir" "$session")"
-  if [ -n "$wid" ]; then
-    echo "herdr: workspace $wid shows the live session"
-  fi
+  echo "orca: worktree $dir, terminal $handle, visible in the Orca app"
   echo "up: $name - read it with: lane read $name"
 }
 
 cmd_prompt() { # <name> <job-id> <text...>
   [ $# -ge 3 ] || usage 2 "lane prompt <name> <job-id> <prompt text>"
-  local name="$1" job="$2" session jobfile text hash
+  local name="$1" job="$2" jobfile text hash handle out req
   shift 2
   valid_name "$name" || usage 2 "lane prompt <name> ... - bad lane name"
   valid_job "$job" || usage 2 "lane prompt <name> <job-id> ... - job id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"
@@ -246,7 +270,6 @@ cmd_prompt() { # <name> <job-id> <text...>
   [ -n "$text" ] || usage 2 "lane prompt <name> <job-id> <prompt text> - empty prompt"
   [ "${#text}" -le "$MAX_PROMPT" ] || die "prompt is ${#text} chars, cap is $MAX_PROMPT - split it or write it to a file in the lane"
 
-  session="$(session_of "$name")"
   [ -d "$REGISTRY/$name" ] || die "lane $name does not exist - run: lane up $name"
   lock_lane "$REGISTRY/$name"
 
@@ -265,30 +288,32 @@ cmd_prompt() { # <name> <job-id> <text...>
   fi
 
   [ "$(cat "$REGISTRY/$name/state")" = active ] || die "lane $name is archived - run: lane up $name"
-  have_session "$session" || die "tmux session $session is gone - run: lane up $name"
-  agent_running "$session" || die "pane is running '$(pane_cmd "$session")', not claude - inspect with: lane read $name"
+  handle="$(cat "$REGISTRY/$name/terminal" 2>/dev/null || true)"
+  terminal_live "$handle" || die "orca terminal for $name is gone - run: lane up $name"
 
   hash="$(printf '%s' "$text" | shasum -a 256 | awk '{print $1}')"
   {
     printf 'job: %s\n' "$job"
     printf 'accepted: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'terminal: %s\n' "$handle"
     printf 'prompt_sha256: %s\n' "$hash"
     printf 'prompt_chars: %s\n' "${#text}"
   } > "$jobfile"
 
-  # Bracketed paste (-p) drops the whole prompt into the TUI as paste, so
-  # newlines in the text stay text; a separate Enter then submits. -d frees
-  # the buffer after the paste.
-  tmux set-buffer -b "lanejob-$job" -- "$text"
-  if ! tmux paste-buffer -p -d -t "$session" -b "lanejob-$job" 2>/dev/null; then
-    tmux delete-buffer -b "lanejob-$job" 2>/dev/null || true
-    die "paste into $session failed"
-  fi
-  sleep 1
-  tmux send-keys -t "$session" Enter
+  # Orca types the text into the agent's composer and appends Enter itself, so
+  # newlines in the prompt stay text. --wait-submit turns the send into an
+  # observed submission rather than a hopeful write.
+  out="$("$ORCA_BIN" terminal send --terminal "$handle" --text "$text" --enter \
+         --wait-submit "$SUBMIT_WAIT_S" --json 2>/dev/null)" ||
+    die "orca terminal send to $name failed"
+  [ "$(printf '%s' "$out" | jfield result.send.accepted)" = True ] ||
+    die "orca did not accept the prompt for $name - inspect with: lane read $name"
+  req="$(printf '%s' "$out" | jfield result.send.prompt.requestId)"
+  printf 'request_id: %s\n' "$req" >> "$jobfile"
+  printf 'stages: %s\n' "$(printf '%s' "$out" | jfield result.send.prompt.stages)" >> "$jobfile"
   printf 'submitted: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$jobfile"
 
-  echo "submitted: job $job to $name (${#text} chars, sha256 ${hash:0:12}...)"
+  echo "submitted: job $job to $name (${#text} chars, sha256 ${hash:0:12}..., terminal $handle)"
   echo "verify by reading the pane: lane read $name"
 }
 
@@ -307,8 +332,7 @@ control_text() { # <command>
 }
 
 control_one() { # <command> <job-id> <name> - runs in its own subshell; returns, never exits
-  local cmd="$1" job="$2" name="$3" session jobfile text
-  session="$(session_of "$name")"
+  local cmd="$1" job="$2" name="$3" jobfile text handle
   [ -d "$REGISTRY/$name" ] || { err "lane $name: does not exist - skipped"; return 1; }
   jobfile="$REGISTRY/$name/jobs/$job"
   if [ -f "$jobfile" ]; then
@@ -316,8 +340,8 @@ control_one() { # <command> <job-id> <name> - runs in its own subshell; returns,
     return 0
   fi
   [ "$(cat "$REGISTRY/$name/state" 2>/dev/null)" = active ] || { err "lane $name: archived - skipped"; return 1; }
-  have_session "$session" || { err "lane $name: no live tmux session - skipped"; return 1; }
-  agent_running "$session" || { err "lane $name: pane is running '"'"'$(pane_cmd "$session")'"'"', not claude - skipped"; return 1; }
+  handle="$(cat "$REGISTRY/$name/terminal" 2>/dev/null || true)"
+  terminal_live "$handle" || { err "lane $name: no live orca terminal - skipped"; return 1; }
 
   text="$(control_text "$cmd")"
   try_lock_lane "$REGISTRY/$name" ||
@@ -326,14 +350,14 @@ control_one() { # <command> <job-id> <name> - runs in its own subshell; returns,
     printf 'job: %s\n' "$job"
     printf 'control: %s\n' "$cmd"
     printf 'accepted: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'terminal: %s\n' "$handle"
   } > "$jobfile"
-  tmux set-buffer -b "lanectl-$job-$name" -- "$text"
-  if ! tmux paste-buffer -p -d -t "$session" -b "lanectl-$job-$name" 2>/dev/null; then
-    tmux delete-buffer -b "lanectl-$job-$name" 2>/dev/null || true
-    err "lane $name: paste failed"
+  # No --wait-submit: a control that waits on the turn it is interrupting is
+  # not a control.
+  "$ORCA_BIN" terminal send --terminal "$handle" --text "$text" --enter --json >/dev/null 2>&1 || {
+    err "lane $name: orca terminal send failed"
     return 1
-  fi
-  tmux send-keys -t "$session" Enter
+  }
   printf 'submitted: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$jobfile"
   printf '%s: %s sent\n' "$name" "$cmd"
 }
@@ -342,10 +366,10 @@ cmd_control() { # <command> <job-id> <name>...
   [ $# -ge 3 ] || usage 2 "lane control <mute|unmute> <job-id> <lane>..."
   local cmd="$1" job="$2" rc=0 pid pids="" seen=""
   shift 2
-  control_text "$cmd" >/dev/null || usage 2 "lane control <mute|unmute> ... - unknown control command '"'"'$cmd'"'"'"
+  control_text "$cmd" >/dev/null || usage 2 "lane control <mute|unmute> ... - unknown control command '$cmd'"
   valid_job "$job" || usage 2 "lane control <command> <job-id> ... - job id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"
   for name in "$@"; do
-    valid_name "$name" || usage 2 "lane control ... - bad lane name '"'"'$name'"'"'"
+    valid_name "$name" || usage 2 "lane control ... - bad lane name '$name'"
     case " $seen " in *" $name "*) continue ;; esac
     seen="$seen $name"
   done
@@ -362,51 +386,57 @@ cmd_control() { # <command> <job-id> <name>...
 
 cmd_read() { # <name> [lines]
   [ $# -ge 1 ] && [ $# -le 2 ] || usage 2 "lane read <name> [lines]"
-  local name="$1" lines="${2:-100}" session
+  local name="$1" lines="${2:-100}" handle
   valid_name "$name" || usage 2 "lane read <name> - bad lane name"
   case "$lines" in ''|*[!0-9]*) usage 2 "lane read <name> [lines] - lines must be a number" ;; esac
   [ "$lines" -le "$MAX_READ" ] || lines="$MAX_READ"
-  session="$(session_of "$name")"
-  have_session "$session" || die "no live tmux session for $name (archived or rebooted) - state: $(cat "$REGISTRY/$name/state" 2>/dev/null || echo unknown)"
-  echo "# lane: $name   session: $session   pane running: $(pane_cmd "$session")   lines: $lines"
-  tmux capture-pane -p -t "$session" -S "-$lines"
+  handle="$(cat "$REGISTRY/$name/terminal" 2>/dev/null || true)"
+  terminal_live "$handle" || die "no live orca terminal for $name (archived or closed) - state: $(cat "$REGISTRY/$name/state" 2>/dev/null || echo unknown)"
+  echo "# lane: $name   orca terminal: $handle   lines: $lines"
+  # --screen, not the default stream: a TUI repaints, and the accumulated
+  # stream reads as stacked fragments rather than as what the pane shows.
+  "$ORCA_BIN" terminal read --terminal "$handle" --screen --json 2>/dev/null |
+    python3 -c 'import json,sys
+try:
+    t = json.load(sys.stdin)["result"]["terminal"]
+except Exception:
+    sys.exit("lane: could not read the terminal")
+print("\n".join(t.get("tail", [])[-int(sys.argv[1]):]))' "$lines"
 }
 
 cmd_list() {
-  local name state session alive
+  local name state handle alive
   [ -d "$REGISTRY" ] || { echo "no lanes yet"; return 0; }
   for d in "$REGISTRY"/*/; do
     [ -d "$d" ] || continue
     name="$(basename "$d")"
     state="$(cat "$d/state" 2>/dev/null || echo unknown)"
-    session="$(session_of "$name")"
-    if have_session "$session"; then alive="tmux alive ($(pane_cmd "$session"))"; else alive="no live session"; fi
+    handle="$(cat "$d/terminal" 2>/dev/null || true)"
+    if terminal_live "$handle"; then alive="orca $handle"; else alive="no live terminal"; fi
     printf '%-32s %-9s %s\n' "$name" "$state" "$alive"
   done
 }
 
 cmd_stop() { # <name>
   [ $# -eq 1 ] || usage 2 "lane stop <name>"
-  local name="$1" session wid
+  local name="$1" handle
   valid_name "$name" || usage 2 "lane stop <name> - bad lane name"
   [ -d "$REGISTRY/$name" ] || die "lane $name does not exist"
-  session="$(session_of "$name")"
   lock_lane "$REGISTRY/$name"
 
-  if have_session "$session"; then
-    tmux kill-session -t "$session"
-    echo "stopped: tmux session $session killed"
+  handle="$(cat "$REGISTRY/$name/terminal" 2>/dev/null || true)"
+  if terminal_live "$handle"; then
+    "$ORCA_BIN" terminal close --terminal "$handle" --tab --json >/dev/null 2>&1 ||
+      err "lane: warn: orca could not close terminal $handle"
+    echo "stopped: orca terminal $handle closed"
   else
-    echo "stopped: no live tmux session"
+    echo "stopped: no live orca terminal"
   fi
-  if [ -s "$REGISTRY/$name/workspace" ] && herdr_ok; then
-    wid="$(cat "$REGISTRY/$name/workspace")"
-    herdr workspace close "$wid" >/dev/null 2>&1 || true
-    rm -f "$REGISTRY/$name/workspace"
-    echo "herdr: workspace $wid closed"
-  fi
+  rm -f "$REGISTRY/$name/terminal"
+  # The worktree and its directory stay: `lane up` revives the lane, and the
+  # work it did is still on disk.
   printf 'archived\n' > "$REGISTRY/$name/state"
-  echo "archived: $name - ledger and $LANES_ROOT/$name kept; 'lane up $name' revives it"
+  echo "archived: $name - ledger, orca worktree and $LANES_ROOT/$name kept; 'lane up $name' revives it"
 }
 
 case "${1:-}" in

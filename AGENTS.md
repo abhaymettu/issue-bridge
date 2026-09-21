@@ -199,9 +199,11 @@ issue body. The create, act, and read-back steps belong inside one wrapper
 invocation, because the bridge cannot sequence them for you.
 
 **No output proves nothing.** Some pane-driving commands (for example
-`herdr pane run`) print nothing on success. Exit 0 means the process you invoked
-succeeded, not that the work it handed off elsewhere did. Use the tool's own
-read-back or status operation, in the same wrapper, when it matters.
+`orca terminal send`) print an acceptance, not a result. Exit 0 means the
+process you invoked succeeded, not that the work it handed off elsewhere did.
+Use the tool's own read-back or status operation, in the same wrapper, when it
+matters: for a lane that is `lane read <name>`, which returns the rendered Orca
+pane.
 
 ## If your own browser is capped
 

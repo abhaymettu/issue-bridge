@@ -86,13 +86,13 @@ There is no SDK. The protocol is an issue body, and it is written down in
    {
      "repo": "you/your-lane-repo",
      "label": "exec-job",
-     "allow": ["herdr", "git -C /Users/you/code/site", "uname"],
+     "allow": ["orca", "git -C /Users/you/code/site", "uname"],
      "poll_interval": 60
    }
    ```
 
-   Each entry is a **token prefix** of the argv it permits. `"herdr"` allows
-   every `herdr` subcommand. Matching is on whole tokens, so `uname` never
+   Each entry is a **token prefix** of the argv it permits. `"orca"` allows
+   every `orca` subcommand. Matching is on whole tokens, so `uname` never
    matches `unamex`. The config is re-read at the top of every cycle, so a change
    needs no restart, but it does not reach a batch already being processed.
 
@@ -164,6 +164,23 @@ guess.
 A fresh workspace per job also keeps concurrent work apart: two jobs sharing one
 pane interleave their input. Create, act, read back, and tear down when the work
 is done, all in one wrapper.
+
+### Lanes run in Orca
+
+`lane` is this machine's one allowlisted wrapper, and since the Orca migration a
+lane is an Orca worktree plus one visible Orca terminal running Claude Code, not
+a hidden one-shot process. `lane up <name>` creates or resumes it, `lane prompt
+<name> <job-id> <text>` types the job into that pane, and `lane read <name>`
+returns what the pane renders. The job id is the issue number, recorded before
+the send, so a refiled issue is suppressed rather than run twice.
+
+The effect is that a job filed from a phone lands somewhere you can point at: it
+shows up in the Orca sidebar under the lane's name, and `orca terminal list`
+names the terminal that is running it.
+
+The pre-Orca tmux and herdr backend is kept verbatim as `lane-herdr` beside the
+wrapper. `ISSUE_BRIDGE_LANE_BACKEND=herdr` hands the whole invocation to it.
+Nothing on the Orca path calls herdr.
 
 ## Operating it
 
