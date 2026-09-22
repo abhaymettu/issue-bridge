@@ -1,0 +1,16 @@
+PASS  kill exits 0
+PASS  kill touches issue-bridge DISABLED
+PASS  kill touches atlas-gateway DISABLED
+PASS  kill touches direct-line DISABLED
+PASS  kill skips a missing root without failing
+PASS  kill does not recreate a missing root
+PASS  status exits 0 against sparse roots
+PASS  status reports issue-bridge DISABLED present
+PASS  status never calls real launchctl
+PASS  resume exits 0
+PASS  resume removes issue-bridge DISABLED
+PASS  resume removes atlas-gateway DISABLED
+PASS  restart nope (bad label) exits 64
+PASS  restart bridge.poller (dry-run) exits 0
+PASS  unknown action exits 64
+15/15 passed
