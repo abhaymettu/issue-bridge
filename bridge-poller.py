@@ -10,13 +10,19 @@ no inbound port, no tunnel, no VPN.
 
 Protocol: AGENTS.md. Setup: README.md.
 """
-import calendar, json, os, pathlib, shlex, shutil, subprocess, sys, tempfile, threading, time
+import calendar, json, os, pathlib, re, shlex, shutil, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request
 
-VERSION = "1.1.0"
+import capabilities
+
+VERSION = "1.2.0"
 HOME = pathlib.Path(os.environ.get("ISSUE_BRIDGE_HOME")
                     or pathlib.Path.home() / ".config/issue-bridge")
 CONFIG, TOKEN, STATUS = HOME / "config.json", HOME / "github-token", HOME / "status.json"
+RECEIPTS = HOME / "receipts"
+# The full digest, not a prefix: eight hex chars is a 32-bit target that a body
+# edit could be searched against; sixty-four is not.
+APPROVE_RE = re.compile(r"\s*/approve\s+([0-9a-f]{64})\s*")
 API = "https://api.github.com/repos/"
 # Labels this bridge was filed under before the rename. Agents, saved snippets and old
 # runbooks still use them, and an issue carrying only the old label used to sit open
@@ -32,7 +38,7 @@ TIMEOUT = 900           # per-command wall clock
 _status = {"version": VERSION, "ts": 0, "last_poll_ok": None, "last_drain_ts": None,
            "queue_depth": 0, "last_error": None, "pat_expiry": None,
            "pending_writebacks": [], "legacy_label_jobs": [], "runner": None,
-           "running": None}
+           "running": None, "disabled": False, "rate_limited": None, "approval_asked": []}
 
 
 def config():
@@ -40,10 +46,22 @@ def config():
     cfg.setdefault("label", "exec-job")
     cfg.setdefault("poll_interval", 60)
     cfg.setdefault("allow", [])
+    cfg.setdefault("owner", None)
+    # jobs_per_hour caps everything; privileged_per_hour additionally caps the three
+    # gated classes. Defaults match spec.md; either is overridable per machine.
+    cfg["rate"] = dict({"jobs_per_hour": 30, "privileged_per_hour": 5}, **(cfg.get("rate") or {}))
     # "orca" runs each job in a visible Orca terminal; "subprocess" is the pre-Orca
     # hidden child, kept as the rollback. ISSUE_BRIDGE_RUNNER overrides for one run.
     cfg["runner"] = os.environ.get("ISSUE_BRIDGE_RUNNER") or cfg.get("runner") or "orca"
     cfg.setdefault("orca_lane", "~/lanes/bridge-jobs")
+    # A bad capabilities table fails closed: the poller keeps running (legacy argv
+    # jobs still work), but no `capability:` job can resolve, and the reason is
+    # visible in status.json rather than only in a log nobody reads.
+    try:
+        cfg["_capabilities"] = capabilities.load(cfg)
+    except ValueError as e:
+        cfg["_capabilities"] = {}
+        _status["last_error"] = "capabilities: %s" % e
     return cfg
 
 
@@ -149,16 +167,19 @@ def allowed(argv, allow):
 
 # --- running ------------------------------------------------------------
 
-def run(argv):
+def run(argv, timeout=None):
     """The hidden runner: a child of the poller with its output on pipes. It is
     the rollback (`"runner": "subprocess"`) and the fallback when Orca cannot be
-    reached, so the queue drains either way."""
+    reached, so the queue drains either way. `timeout=None` reads the module's
+    TIMEOUT at call time rather than binding it at def time, so a test (or a
+    capability) that changes it still takes effect."""
+    timeout = TIMEOUT if timeout is None else timeout
     t0 = time.time()
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT)
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         r = {"exit": p.returncode, "stdout": p.stdout, "stderr": p.stderr}
     except subprocess.TimeoutExpired:
-        r = {"exit": None, "stdout": "", "stderr": "timeout after %ds" % TIMEOUT}
+        r = {"exit": None, "stdout": "", "stderr": "timeout after %ds" % timeout}
     except OSError as e:
         r = {"exit": None, "stdout": "", "stderr": str(e)}
     r["duration"] = round(time.time() - t0, 3)
@@ -281,18 +302,18 @@ def job_result(jobdir, note=None):
             "duration": meta.get("duration")}
 
 
-def hidden(argv, why):
-    r = run(argv)
+def hidden(argv, why, timeout=None):
+    r = run(argv, timeout=timeout)
     r["stderr"] += ("\n" if r["stderr"] else "") + "[issue-bridge] ran as a hidden subprocess: " + why
     return r
 
 
-def await_job(cfg, jobdir, handle, started):
+def await_job(cfg, jobdir, handle, started, timeout):
     """Wait for the tab to exit, then read the files. The wait is re-issued in
     bounded slices so an Orca restart mid-job costs one slice, not the job. Past
-    TIMEOUT the tab is closed, which hangs up the PTY and everything the command
+    the timeout the tab is closed, which hangs up the PTY and everything the command
     started under it; whatever it printed before that is kept."""
-    deadline = started + TIMEOUT
+    deadline = started + timeout
     while True:
         if (jobdir / "exit.json").exists():
             return job_result(jobdir)
@@ -302,29 +323,35 @@ def await_job(cfg, jobdir, handle, started):
         w = orca(cfg, "terminal", "wait", "--terminal", handle, "--for", "exit",
                  "--timeout-ms", str(int(min(left, 60) * 1000)), timeout=min(left, 60) + 30)
         if w is None:
-            show = orca(cfg, "terminal", "show", "--terminal", handle)
-            if show and show.get("terminal", {}).get("connected"):
-                time.sleep(5)
-                continue
-        elif not w.get("wait", {}).get("satisfied"):
+            # F8: `wait` failing to answer is not proof the job ended, whether
+            # `show` confirms the terminal, fails outright, or reports it is not
+            # connected. Keep polling in the same bounded slices until exit.json
+            # appears or the deadline passes, instead of falling through to
+            # "ended without recording a result" on the first comms hiccup.
+            orca(cfg, "terminal", "show", "--terminal", handle)
+            time.sleep(5)
+            continue
+        if not w.get("wait", {}).get("satisfied"):
             continue
         time.sleep(1)  # the runner writes exit.json before the PTY closes; give the fs a beat
         return job_result(jobdir, None if (jobdir / "exit.json").exists() else
                           "the Orca terminal ended without recording a result")
     orca(cfg, "terminal", "close", "--terminal", handle, "--tab")
-    r = job_result(jobdir, "timeout after %ds; the Orca terminal was closed" % TIMEOUT)
+    r = job_result(jobdir, "timeout after %ds; the Orca terminal was closed" % timeout)
     r["exit"], r["duration"] = None, round(time.time() - started, 3)
     return r
 
 
-def run_visible(cfg, issue, argv, rec):
+def run_visible(cfg, issue, argv, rec, timeout=None):
     """Run one job in its own visible Orca terminal. `rec` is the job's writeback
     journal entry: the terminal handle and job directory go into it as soon as
     they exist, so a restarted poller can find the tab instead of the label."""
+    timeout = TIMEOUT if timeout is None else timeout
     n = issue["number"]
     lane = job_lane(cfg)
     if lane is None:
-        return hidden(argv, "Orca is not reachable (orca CLI missing, runtime down, or the job lane could not be adopted)")
+        return hidden(argv, "Orca is not reachable (orca CLI missing, runtime down, or the job lane could not be adopted)",
+                      timeout=timeout)
     jobdir = JOBS / str(n)
     jobdir.mkdir(parents=True, exist_ok=True, mode=0o700)
     for name in ("stdout", "stderr", "exit.json"):
@@ -338,14 +365,14 @@ def run_visible(cfg, issue, argv, rec):
                "--title", title, "--command", cmd)
     handle = ((res or {}).get("terminal") or {}).get("handle")
     if not handle:
-        return hidden(argv, "orca terminal create failed")
-    rec.update({"jobdir": str(jobdir), "terminal": handle, "started": started})
+        return hidden(argv, "orca terminal create failed", timeout=timeout)
+    rec.update({"jobdir": str(jobdir), "terminal": handle, "started": started, "timeout": timeout})
     save_pending(rec)
     _status["running"] = {"issue": n, "terminal": handle, "lane": str(lane),
                           "started_at": now(), "title": title}
     write_status()
     try:
-        return await_job(cfg, jobdir, handle, started)
+        return await_job(cfg, jobdir, handle, started, timeout=timeout)
     finally:
         _status["running"] = None
 
@@ -355,7 +382,7 @@ def resume_job(cfg, rec):
     ran in Orca. Wait for it if it is still running, recover its result from the
     job directory, and never run the command again."""
     return await_job(cfg, pathlib.Path(rec["jobdir"]), rec["terminal"],
-                     rec.get("started") or time.time())
+                     rec.get("started") or time.time(), timeout=rec.get("timeout") or TIMEOUT)
 
 
 
@@ -515,6 +542,187 @@ def legacy_note(cfg, issue):
             % (old, cfg["label"], cfg["label"]))
 
 
+def not_run(cfg, issue, body, done=False):
+    """Journal and answer a job that never ran (unparseable, stale, or denied):
+    no result block, since there is no result. Shared by the legacy `argv:`
+    path and the `capability:` path so both dead ends look the same on the
+    issue."""
+    n = issue["number"]
+    rec = {"issue": n, "done": done, "comment": legacy_note(cfg, issue) + body,
+           "steps": {}, "attempts": 0, "created": now(), "body": None}
+    save_pending(rec)
+    return writeback(cfg, rec)
+
+
+def actor(cfg, issue):
+    """Who filed it and who labelled it, for the receipt. A failed lookup reads
+    as "unknown" rather than raising: a capability job should not lose its
+    result over an events-endpoint hiccup."""
+    author = ((issue.get("user") or {}).get("login")) or "unknown"
+    labelled_by = "unknown"
+    try:
+        events = gh(cfg, "GET", "/issues/%d/events?per_page=100" % issue["number"]) or []
+        wanted = set([cfg["label"]] + legacy_aliases(cfg))
+        for e in events:
+            if e.get("event") == "labeled" and (e.get("label") or {}).get("name") in wanted:
+                labelled_by = ((e.get("actor") or {}).get("login")) or "unknown"  # last one wins
+    except Exception:
+        labelled_by = "unknown"
+    return {"author": author, "labelled_by": labelled_by}
+
+
+def find_approval(cfg, issue, dig):
+    """The id of an owner `/approve <digest>` comment on this issue that has
+    not already been spent on an earlier receipt, or None."""
+    n = issue["number"]
+    try:
+        comments = gh(cfg, "GET", "/issues/%d/comments?per_page=100" % n) or []
+    except Exception:
+        return None
+    used = set()  # approval ids this issue already spent, from its own few receipts
+    for p in pathlib.Path(RECEIPTS).glob("*-%d.json" % n):
+        try:
+            used.add(json.loads(p.read_text()).get("approval"))
+        except (OSError, ValueError):
+            pass
+    found = None
+    if not cfg.get("owner"):
+        return None  # no owner configured means nobody can approve, not anybody
+    for c in comments:
+        if (c.get("user") or {}).get("login") != cfg["owner"]:
+            continue
+        m = APPROVE_RE.fullmatch(c.get("body") or "")
+        if m and m.group(1) == dig and c.get("id") not in used:
+            found = c.get("id")  # keep scanning; the most recent match wins
+    return found
+
+
+def class_gate(cfg, issue, job, dig):
+    """(True, approval_id) once a job may run. For the three privileged classes
+    that means an unused owner `/approve` comment; anything else is `read` or
+    `mutate` and needs none. A gated job that lacks approval gets one comment
+    (never repeated while it keeps waiting) and keeps its label."""
+    if job["class"] not in capabilities.PRIVILEGED:
+        return True, None
+    n = issue["number"]
+    approval_id = find_approval(cfg, issue, dig)
+    if approval_id is not None:
+        return True, approval_id
+    if n not in _status["approval_asked"]:
+        gh(cfg, "POST", "/issues/%d/comments" % n, {"body": (
+            "**owner approval needed** - capability `%s` is class `%s`.\n\n"
+            "To approve this exact request, comment:\n\n```\n/approve %s\n```\n"
+            % (job["name"], job["class"], dig))})
+        _status["approval_asked"].append(n)
+    return False, None
+
+
+def run_capability(cfg, issue, name, params, job, act, approval_id):
+    """Run a resolved capability job through the existing runner, then write
+    its receipt. Mirrors the legacy `argv:` run path: label dropped and a
+    pre-run journal entry saved before anything executes, so a crash mid-run
+    is survivable and never re-runs the command."""
+    n = issue["number"]
+    relabel(cfg, n, None)
+    pre = {"issue": n, "done": False, "body": None, "steps": {}, "attempts": 0,
+           "created": now(), "capability": name, "timeout": job["timeout"],
+           "comment": "**result lost** - the poller stopped between starting capability "
+                      "`%s` and recording its output. The command may have run; it will "
+                      "not be run again. Refile if you still need it.\n" % name}
+    save_pending(pre)
+
+    started_at = now()
+    # The receipt exists before the command does. Its approval id is therefore
+    # spent even if the poller dies mid-run and the issue is later relabelled.
+    fields = {"issue": n, "actor": act, "capability": name, "class": job["class"],
+              "params_sha256": capabilities.digest(params), "approval": approval_id,
+              "exit": None, "duration": None, "changed_paths": [], "changed_truncated": False,
+              "runner": cfg.get("runner"), "started": started_at, "finished": None}
+    rid = capabilities.receipt(RECEIPTS, fields)
+    if cfg.get("runner") == "orca":
+        # Inside the job dir for orca: run_visible re-creates the dir and clears
+        # stdout/stderr/exit.json, but leaves any other file alone.
+        jobdir = JOBS / str(n)
+        jobdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker = jobdir / "marker"
+        marker.write_text("")
+        r = run_visible(cfg, issue, job["argv"], pre, timeout=job["timeout"])
+    else:
+        fd, marker_name = tempfile.mkstemp(prefix="issue-bridge-marker-")
+        os.close(fd)
+        marker = pathlib.Path(marker_name)
+        r = run(job["argv"], timeout=job["timeout"])
+    finished_at = now()
+
+    try:
+        changed_paths, truncated = capabilities.changed(job["changed_roots"], str(marker))
+    except OSError:
+        changed_paths, truncated = [], False
+    finally:
+        if cfg.get("runner") != "orca":
+            marker.unlink(missing_ok=True)
+
+    capabilities.receipt(RECEIPTS, dict(
+        fields, exit=r["exit"], duration=r["duration"], changed_paths=changed_paths,
+        changed_truncated=truncated, finished=finished_at), rid)
+
+    out, err = budget(r["stdout"], r["stderr"])
+    body = ("receipt: %s  changed: %d%s\n\n"
+            "exit: `%s`  duration: `%ss`\n\n**stdout**\n```\n%s\n```\n"
+            "**stderr**\n```\n%s\n```\n"
+            % (rid, len(changed_paths), "+" if truncated else "", r["exit"], r["duration"], out, err))
+    rec = {"issue": n, "done": r["exit"] == 0, "comment": legacy_note(cfg, issue) + body,
+           "steps": {}, "attempts": 0, "created": now(),
+           "body": _rb_body(issue.get("body") or "", r), "receipt": rid}
+    save_pending(rec)
+    return writeback(cfg, rec)
+
+
+def handle_capability(cfg, issue, fm, rule):
+    """The `capability:` body path: resolve through the table, then the kill
+    switch, the rate cap and the class gate, in that order, before anything
+    runs."""
+    n = issue["number"]
+    name = fm.get("capability", "")
+    try:
+        params = json.loads(fm.get("params", "{}"))
+    except ValueError:
+        params = None
+    if not isinstance(params, dict):
+        return not_run(cfg, issue, "**not run** - `params` must be a JSON object on one line.\n")
+    if stale(fm, rule):
+        return not_run(cfg, issue, "**not run** - missed its window (rule `%s`, ttl `%s`s, queued `%s`).\n"
+                       % (rule, fm.get("ttl"), fm.get("queued_at")))
+
+    job, reason = capabilities.resolve(cfg["_capabilities"], name, params)
+    if job is None:
+        # `reason` names the capability and the field, never a parameter value:
+        # capabilities.resolve() guarantees that, so it is safe to post verbatim.
+        return not_run(cfg, issue,
+            "**denied** - %s\n\nThis is final for this exact request: refiling the same "
+            "capability and parameters gets the same answer.\n" % reason)
+
+    rate = cfg["rate"]
+    over_total = capabilities.recent_count(RECEIPTS, 3600) >= rate["jobs_per_hour"]
+    over_privileged = (job["class"] in capabilities.PRIVILEGED and
+                       capabilities.recent_count(RECEIPTS, 3600, classes=capabilities.PRIVILEGED)
+                       >= rate["privileged_per_hour"])
+    if over_total or over_privileged:
+        # Over the cap keeps the label and waits; it is never dropped.
+        _status["rate_limited"] = n
+        return None
+    _status["rate_limited"] = None
+
+    # The approval names the whole request, capability and params together, so
+    # editing the body to another capability with the same params does not reuse it.
+    dig = capabilities.digest({"capability": name, "params": params})
+    ok, approval_id = class_gate(cfg, issue, job, dig)
+    if not ok:
+        return None
+
+    return run_capability(cfg, issue, name, params, job, actor(cfg, issue), approval_id)
+
+
 def handle(cfg, issue):
     n = issue["number"]
     rec = load_pending(n)
@@ -522,57 +730,65 @@ def handle(cfg, issue):
         # A journal entry means this job already executed (or was already answered).
         # Finish the paperwork; do not parse, and above all do not run, again.
         return writeback(cfg, rec)
-    r = None
+    # Kill switch, before the body is even parsed: nothing runs, nothing is
+    # commented, the label stays, and the job is picked up once the file goes.
+    # Journal writebacks above still finish, since their command already ran.
+    _status["disabled"] = capabilities.disabled(HOME)
+    if _status["disabled"]:
+        return None
     fm = parse(issue.get("body"))
     rule = fm.get("rule", "drain-on-wake")
+
+    if "capability" in fm:
+        return handle_capability(cfg, issue, fm, rule)
+
     try:
         argv = json.loads(fm.get("argv", "null"))
     except ValueError:
         argv = None
 
     if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
-        done = False
-        body = ("**not run** - the body did not parse.\n\n`argv` must be a JSON array "
-                "of strings on one line:\n\n```\n---\nargv: [\"uname\", \"-a\"]\n"
-                "rule: drain-on-wake\nqueued_at: %s\nttl: 3600\n---\n```\n" % now())
-    elif stale(fm, rule):
-        done = False
-        body = ("**not run** - missed its window (rule `%s`, ttl `%s`s, queued `%s`).\n"
-                % (rule, fm.get("ttl"), fm.get("queued_at")))
-    elif not allowed(argv, cfg["allow"]):
-        done = False
+        return not_run(cfg, issue,
+            "**not run** - the body did not parse.\n\n`argv` must be a JSON array "
+            "of strings on one line:\n\n```\n---\nargv: [\"uname\", \"-a\"]\n"
+            "rule: drain-on-wake\nqueued_at: %s\nttl: 3600\n---\n```\n" % now())
+    if stale(fm, rule):
+        return not_run(cfg, issue, "**not run** - missed its window (rule `%s`, ttl `%s`s, queued `%s`).\n"
+                       % (rule, fm.get("ttl"), fm.get("queued_at")))
+    if not cfg["allow"]:
+        # Migration compat (spec.md): once `allow` is emptied, an `argv:` body is
+        # not merely unmatched, it is off the map entirely. Point at the door
+        # that is actually open now, instead of the generic allowlist denial.
+        return not_run(cfg, issue,
+            "**denied** - this machine no longer accepts a plain `argv:` body; "
+            "`allow` is empty. File the job as `capability: <name>` with `params:` "
+            "instead. See AGENTS.md.\n")
+    if not allowed(argv, cfg["allow"]):
         # The whole argv, not argv[0]: an entry like `git -C /srv/repo` denies on a
         # later token, and naming only `git` would read as a lie.
-        body = ("**denied** - `%s` is not on this machine's allowlist, so nothing ran.\n\n"
-                "This is final: refiling the same argv gets the same answer. Ask the "
-                "machine's owner to add it to `allow` in the poller config.\n"
-                % clip(shlex.join(argv), 200))
-    else:
-        # Drop the label BEFORE running. A crash between here and the comment
-        # loses the result, which is survivable; keeping the label would re-run
-        # a command with side effects, which is not.
-        relabel(cfg, n, None)
-        # Journal before running. If the poller dies mid-command the next cycle
-        # finds this entry, says so on the issue, and does not run it again.
-        pre = {"issue": n, "done": False, "body": None, "steps": {},
-               "attempts": 0, "created": now(), "argv": shlex.join(argv),
-               "comment": "**result lost** - the poller stopped between starting "
-                          "`%s` and recording its output. The command may have run; "
-                          "it will not be run again. Refile if you still need it.\n"
-                          % clip(shlex.join(argv), 200)}
-        save_pending(pre)
-        r = run_visible(cfg, issue, argv, pre) if cfg.get("runner") == "orca" else run(argv)
-        rec = result_record(cfg, issue, r, legacy_note(cfg, issue))
-        save_pending(rec)
-        return writeback(cfg, rec)
+        return not_run(cfg, issue,
+            "**denied** - `%s` is not on this machine's allowlist, so nothing ran.\n\n"
+            "This is final: refiling the same argv gets the same answer. Ask the "
+            "machine's owner to add it to `allow` in the poller config.\n"
+            % clip(shlex.join(argv), 200))
 
-    # --- local deployment patch: journalled writeback (not upstream)
-    # denied, unparseable and stale jobs never ran, so they carry no result block
-    rec = {"issue": n, "done": done, "comment": legacy_note(cfg, issue) + body,
-           "steps": {}, "attempts": 0, "created": now(), "body": None}
+    # Drop the label BEFORE running. A crash between here and the comment
+    # loses the result, which is survivable; keeping the label would re-run
+    # a command with side effects, which is not.
+    relabel(cfg, n, None)
+    # Journal before running. If the poller dies mid-command the next cycle
+    # finds this entry, says so on the issue, and does not run it again.
+    pre = {"issue": n, "done": False, "body": None, "steps": {},
+           "attempts": 0, "created": now(), "argv": shlex.join(argv),
+           "comment": "**result lost** - the poller stopped between starting "
+                      "`%s` and recording its output. The command may have run; "
+                      "it will not be run again. Refile if you still need it.\n"
+                      % clip(shlex.join(argv), 200)}
+    save_pending(pre)
+    r = run_visible(cfg, issue, argv, pre) if cfg.get("runner") == "orca" else run(argv)
+    rec = result_record(cfg, issue, r, legacy_note(cfg, issue))
     save_pending(rec)
     return writeback(cfg, rec)
-    # --- end local deployment patch ---
 
 
 def result_record(cfg, issue, r, note=""):
@@ -875,6 +1091,243 @@ def self_test():
         finally:
             globals()["orca"], globals()["TIMEOUT"] = real_orca, real_timeout
             globals()["JOBS"] = real_jobs
+
+    # --- F8: `wait` failing to answer must not read as "the job ended" ---
+    with tempfile.TemporaryDirectory() as d:
+        real_orca, real_sleep = orca, time.sleep
+        calls_f8, n_waits = [], {"n": 0}
+        jobdir = pathlib.Path(d) / "jobs" / "55"
+        jobdir.mkdir(parents=True)
+
+        def fake_orca_f8(cfg, *args, timeout=60):
+            calls_f8.append(args[:2])
+            if args[:2] == ("terminal", "wait"):
+                n_waits["n"] += 1
+                if n_waits["n"] == 1:
+                    return None  # comms hiccup: wait itself fails to answer
+                (jobdir / "exit.json").write_text(json.dumps({"exit": 0, "duration": 0.01, "ts": now()}))
+                return {"wait": {"satisfied": True}}
+            if args[:2] == ("terminal", "show"):
+                return None  # show ALSO fails: this is exactly the F8 trap
+            return {}
+
+        globals()["orca"], time.sleep = fake_orca_f8, lambda s: None
+        try:
+            r = await_job({"repo": "x/y"}, jobdir, "term_f8", time.time(), timeout=5)
+            check("F8 recovers the result after wait and show both fail once", r["exit"] == 0)
+            check("F8 re-checks terminal show on a failed wait", ("terminal", "show") in calls_f8)
+            check("F8 does not give up after a single comms hiccup", n_waits["n"] >= 2)
+        finally:
+            globals()["orca"], time.sleep = real_orca, real_sleep
+
+    # --- capability path: kill switch, rate cap, class gate, receipts ---
+    with tempfile.TemporaryDirectory() as d:
+        real_home, real_receipts = HOME, RECEIPTS
+        globals()["HOME"] = pathlib.Path(d) / "home"
+        globals()["HOME"].mkdir()
+        globals()["RECEIPTS"] = globals()["HOME"] / "receipts"
+        real_status, real_pending = STATUS, PENDING
+        globals()["STATUS"] = pathlib.Path(d) / "status.json"
+        globals()["PENDING"] = pathlib.Path(d) / "pending"
+        real_gh2, real_run2 = gh, run
+        _status["approval_asked"], _status["disabled"], _status["rate_limited"] = [], False, None
+
+        # capabilities.resolve() checks changed_roots against the real $HOME, not
+        # ISSUE_BRIDGE_HOME; patch os.path.expanduser (shared with capabilities.py,
+        # same os module) so the check runs entirely inside this tempdir instead of
+        # touching the real home directory.
+        real_expanduser = os.path.expanduser
+        os.path.expanduser = lambda p, _h=globals()["HOME"]: str(_h) if p == "~" else real_expanduser(p)
+
+        target = globals()["HOME"] / "target"
+        target.mkdir()
+        gh_state = {}
+
+        def issue_state(n):
+            return gh_state.setdefault(n, {"closed": False, "labels": set(), "body": "",
+                                           "comments": [], "events": [], "next_id": 1})
+
+        calls2 = []
+
+        def fake_gh2(cfg, method, path, body=None):
+            calls2.append((method, path))
+            m = re.match(r"^/issues/(\d+)(/.*)?$", path.split("?")[0])
+            n = int(m.group(1))
+            rest = m.group(2) or ""
+            st = issue_state(n)
+            if method == "GET" and rest.startswith("/comments"):
+                return [{"id": c["id"], "user": {"login": c["login"]}, "body": c["body"]}
+                        for c in st["comments"]]
+            if method == "GET" and rest.startswith("/events"):
+                return st["events"]
+            if method == "POST" and rest == "/comments":
+                cid = st["next_id"]
+                st["next_id"] += 1
+                st["comments"].append({"id": cid, "login": "poller-bot", "body": body["body"]})
+                return {"id": cid}
+            if method == "POST" and rest == "/labels":
+                st["labels"] |= set(body["labels"])
+                return {}
+            if method == "DELETE" and rest.startswith("/labels/"):
+                st["labels"].discard(urllib.parse.unquote(rest.split("/labels/", 1)[1]))
+                return {}
+            if method == "PATCH" and rest == "":
+                if body and "body" in body:
+                    st["body"] = body["body"]
+                if body and body.get("state") == "closed":
+                    st["closed"] = True
+                return {}
+            return {}
+
+        write_prog = "import sys, pathlib; pathlib.Path(sys.argv[1]).write_text('hi')"
+        cap_cfg = {"capabilities": {
+            "write-file": {"argv": [sys.executable, "-c", write_prog, "{path}"],
+                           "params": {"path": r"^%s/[a-z0-9]{1,20}\.txt$" % re.escape(str(target))},
+                           "class": "mutate", "timeout": 30, "changed_roots": [str(target)]},
+            "danger": {"argv": [sys.executable, "-c", "print('danger-ran')"], "params": {},
+                       "class": "destructive", "timeout": 30, "changed_roots": []},
+        }}
+        cfg2 = {"repo": "x/y", "label": "exec-job", "allow": [], "owner": "abhaymettu",
+                "rate": {"jobs_per_hour": 30, "privileged_per_hour": 5}, "runner": "subprocess"}
+        cfg2["_capabilities"] = capabilities.load(cap_cfg)
+
+        globals()["gh"], globals()["run"] = fake_gh2, real_run2
+        try:
+            # A: a mutate capability runs, writes a receipt with actor and changed path.
+            n = 201
+            issue_state(n)["labels"] = {"exec-job"}
+            issue_state(n)["events"] = [{"event": "labeled", "label": {"name": "exec-job"},
+                                         "actor": {"login": "labeller1"}}]
+            issue = {"number": n, "user": {"login": "filer1"},
+                     "body": '---\ncapability: write-file\nparams: {"path": "%s/out.txt"}\n---\n' % target}
+            handle(cfg2, issue)
+            receipts = sorted(pathlib.Path(globals()["RECEIPTS"]).glob("*-%d.json" % n))
+            check("capability run writes exactly one receipt", len(receipts) == 1)
+            data = json.loads(receipts[0].read_text()) if receipts else {}
+            check("receipt records the actor", data.get("actor") == {"author": "filer1", "labelled_by": "labeller1"})
+            check("receipt records the changed path",
+                  os.path.realpath(target / "out.txt") in (data.get("changed_paths") or []))
+            check("receipt exit is 0", data.get("exit") == 0)
+            check("result comment carries the receipt id",
+                  data.get("id", "\0") in issue_state(n)["comments"][-1]["body"])
+            check("mutate capability closes the issue done", issue_state(n)["closed"]
+                  and "exec-done" in issue_state(n)["labels"])
+
+            # B: unknown capability is denied, never echoing the parameter value.
+            n = 202
+            issue_state(n)["labels"] = {"exec-job"}
+            issue = {"number": n, "body":
+                     '---\ncapability: does-not-exist\nparams: {"secret": "SECRETVALUE123"}\n---\n'}
+            handle(cfg2, issue)
+            check("unknown capability is denied", "denied" in issue_state(n)["comments"][-1]["body"])
+            check("unknown-capability denial never carries a parameter value",
+                  "SECRETVALUE123" not in issue_state(n)["comments"][-1]["body"])
+
+            # C: a regex miss is denied, never echoing the parameter value.
+            n = 203
+            issue_state(n)["labels"] = {"exec-job"}
+            issue = {"number": n, "body":
+                     '---\ncapability: write-file\nparams: {"path": "SECRETPATHVALUE"}\n---\n'}
+            handle(cfg2, issue)
+            check("a param regex miss is denied", "denied" in issue_state(n)["comments"][-1]["body"])
+            check("regex-miss denial never carries the parameter value",
+                  "SECRETPATHVALUE" not in issue_state(n)["comments"][-1]["body"])
+
+            # D: DISABLED leaves the label and posts nothing.
+            n = 204
+            issue_state(n)["labels"] = {"exec-job"}
+            (globals()["HOME"] / "DISABLED").write_text("")
+            before = len(calls2)
+            issue = {"number": n, "body":
+                     '---\ncapability: write-file\nparams: {"path": "%s/d.txt"}\n---\n' % target}
+            result = handle(cfg2, issue)
+            check("DISABLED runs no job", result is None)
+            check("DISABLED makes no GitHub call at all", len(calls2) == before)
+            check("DISABLED leaves the label untouched", issue_state(n)["labels"] == {"exec-job"})
+            # The switch is above the body parse, so a legacy argv job stops too.
+            cfg2["allow"] = ["uname"]
+            result = handle(cfg2, {"number": n, "body": '---\nargv: ["uname"]\n---\n'})
+            check("DISABLED stops a legacy argv job as well", result is None and len(calls2) == before)
+            cfg2["allow"] = []
+            (globals()["HOME"] / "DISABLED").unlink()
+
+            # E: over the rate cap leaves the label and posts nothing.
+            n = 205
+            issue_state(n)["labels"] = {"exec-job"}
+            cfg_rate = dict(cfg2, rate={"jobs_per_hour": 0, "privileged_per_hour": 5})
+            before = len(calls2)
+            issue = {"number": n, "body":
+                     '---\ncapability: write-file\nparams: {"path": "%s/e.txt"}\n---\n' % target}
+            result = handle(cfg_rate, issue)
+            check("over the rate cap runs no job", result is None)
+            check("rate cap makes no GitHub call", len(calls2) == before)
+            check("rate cap leaves the label untouched", issue_state(n)["labels"] == {"exec-job"})
+            check("rate cap is visible in status", _status["rate_limited"] == n)
+
+            # F: a privileged class without approval posts exactly one comment
+            # across two cycles, and leaves the label.
+            n = 206
+            issue_state(n)["labels"] = {"exec-job"}
+            issue = {"number": n, "body": '---\ncapability: danger\nparams: {}\n---\n'}
+            handle(cfg2, issue)
+            handle(cfg2, issue)
+            check("privileged class without approval posts exactly one comment",
+                  len(issue_state(n)["comments"]) == 1)
+            check("the approval comment names the capability and its class",
+                  "danger" in issue_state(n)["comments"][0]["body"]
+                  and "destructive" in issue_state(n)["comments"][0]["body"])
+            check("a pending-approval job leaves the label", issue_state(n)["labels"] == {"exec-job"})
+
+            # G: a matching owner /approve comment lets it run, and the receipt
+            # carries that comment's id.
+            digest8 = capabilities.digest({"capability": "danger", "params": {}})
+            approval_id = issue_state(n)["next_id"]
+            issue_state(n)["comments"].append(
+                {"id": approval_id, "login": "abhaymettu", "body": "/approve %s" % digest8})
+            issue_state(n)["next_id"] += 1
+            handle(cfg2, issue)
+            receipts206 = sorted(pathlib.Path(globals()["RECEIPTS"]).glob("*-%d.json" % n))
+            check("approved privileged job writes one receipt", len(receipts206) == 1)
+            data206 = json.loads(receipts206[0].read_text()) if receipts206 else {}
+            check("the receipt carries the approving comment's id", data206.get("approval") == approval_id)
+            check("approved privileged job closes the issue",
+                  issue_state(n)["closed"] and "exec-done" in issue_state(n)["labels"])
+
+            # H: the same approval comment id is not reused for a second run.
+            _status["approval_asked"] = []
+            before_receipts = len(receipts206)
+            before_comments = len(issue_state(n)["comments"])
+            handle(cfg2, issue)  # journal was retired by G's success; this re-parses the body
+            receipts206b = sorted(pathlib.Path(globals()["RECEIPTS"]).glob("*-%d.json" % n))
+            check("a spent approval id does not run the job again", len(receipts206b) == before_receipts)
+            check("a spent approval id asks for a fresh approval instead",
+                  len(issue_state(n)["comments"]) == before_comments + 1)
+            check("waiting on a fresh approval leaves the label where G left it",
+                  issue_state(n)["labels"] == {"exec-done"})
+
+            # I: an `argv:` body still works while `allow` is non-empty (migration compat).
+            n = 207
+            issue_state(n)["labels"] = {"exec-job"}
+            cfg_allow = dict(cfg2, allow=["uname"])
+            issue = {"number": n, "body": '---\nargv: ["uname", "-a"]\n---\n'}
+            handle(cfg_allow, issue)
+            check("argv body still runs while allow is non-empty",
+                  issue_state(n)["closed"] and "exec-done" in issue_state(n)["labels"])
+
+            # J: an `argv:` body is denied once `allow` is empty, pointing at `capability:`.
+            n = 208
+            issue_state(n)["labels"] = {"exec-job"}
+            issue = {"number": n, "body": '---\nargv: ["uname", "-a"]\n---\n'}
+            handle(cfg2, issue)
+            check("argv body is denied once allow is empty",
+                  "denied" in issue_state(n)["comments"][-1]["body"])
+            check("the empty-allow denial points at capability:",
+                  "capability:" in issue_state(n)["comments"][-1]["body"])
+        finally:
+            globals()["gh"], globals()["run"] = real_gh2, real_run2
+            globals()["HOME"], globals()["RECEIPTS"] = real_home, real_receipts
+            globals()["STATUS"], globals()["PENDING"] = real_status, real_pending
+            os.path.expanduser = real_expanduser
 
     for name, ok in results:
         print("%-42s %s" % (name, "PASS" if ok else "FAIL"))

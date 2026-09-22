@@ -28,13 +28,13 @@ Poller changes, surgical:
 - `handle()`: if the body has `capability:`, resolve through the table; else if `allow`
   is non-empty, keep the old path. Deny text names the capability, never the params.
 - Before running: kill switch, rate cap, class gate (approval lookup: a comment on the
-  issue by `cfg["owner"]` matching `/approve <digest8>`; the gateway-written file form
+  issue by `cfg["owner"]` matching `/approve <digest>`; the gateway-written file form
   comes with P4).
   A gated job that lacks approval gets one comment saying what to approve and keeps
   its label; the poller remembers it commented (journal) so it does not repeat.
 - Actor: `issue["user"]["login"]` plus one call to `/issues/N/events` for the last
   `labeled` event's actor. If the events call fails the receipt says `unknown`.
-- After running: snapshot diff, receipt, comment with receipt id and changed count.
+- After running: changed paths, receipt, comment with receipt id and changed count.
 - `await_job` fall-through (F8): loop until the deadline when both `wait` and `show`
   fail.
 

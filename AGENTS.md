@@ -23,8 +23,23 @@ do not look for ways around a denial.
 
 ## File one command job
 
-Create an issue on the lane with the label `exec-job`, a short title, and a body
-that is YAML frontmatter:
+The preferred body names a capability and gives it parameters, never argv:
+
+```
+---
+capability: git-pull
+params: {"repo": "issue-bridge"}
+---
+```
+
+The operator defines each capability's fixed argv template, its parameter
+regexes, and its class; you only ever send the capability name and the
+parameters it declares. An unknown capability, an unknown parameter, or a
+parameter that fails its regex is refused, and the refusal names the
+capability, never your parameter values.
+
+`argv:` is the legacy form, and it keeps working only while the operator's
+config still has a non-empty `allow` list:
 
 ```
 ---
@@ -32,11 +47,14 @@ argv: ["uname", "-a"]
 ---
 ```
 
-That example matches a fresh install's allowlist.
+That example matches a fresh install's allowlist. Once the operator empties
+`allow`, only `capability:` bodies run.
 
 | Field | Required | Meaning |
 | ----- | -------- | ------- |
-| `argv` | yes | The command as a **JSON array of strings**, one line. Not a shell string. |
+| `capability` | for the capability form | The capability name the operator configured. |
+| `params` | for the capability form | One-line JSON object of the capability's declared parameters. |
+| `argv` | for the legacy form | The command as a **JSON array of strings**, one line. Not a shell string. |
 | `rule` | no | `drain-on-wake` (default), `drop-if-stale`, or `alert`. |
 | `queued_at` | with `ttl` | UTC, `YYYY-MM-DDTHH:MM:SSZ`. |
 | `ttl` | no | Seconds from `queued_at`. Governs whether the job *starts*, not its runtime. |
@@ -95,7 +113,23 @@ owns; you cannot pass prose through `control`, and every named lane is reached
 at once. Jumping the queue is not permission: a control job goes through the
 same allowlist as everything else.
 
-## Scheduling fields, if the job is time-sensitive
+## Privileged capabilities need the owner's approval
+
+A capability whose class is `destructive`, `spend`, or `external-send` does
+not run on your filing alone. The poller posts one comment on the issue
+naming the capability and a 64-character digest, then waits; it does not
+repeat itself on later cycles. Only a comment `/approve <digest>` from the
+operator's own GitHub login, the one configured as `owner`, satisfies it, and
+that approval is single-use.
+
+You cannot approve your own job, whatever access your GitHub token has. Do not
+post an `/approve` comment yourself, and do not ask another bot or service
+account to post one: only the owner login counts, and the poller does not
+tell you who that is beyond what already shows up in the thread. The label
+stays on the issue while it waits, exactly as it would for a job stuck behind
+a rate cap, so an open issue with its label is not evidence of a problem.
+Refiling the same job as a new issue does not skip the approval; it only
+produces a second job waiting on the same kind of comment.
 
 Omitted, `rule` is `drain-on-wake`: the job runs whenever the poller next
 reaches it, however late, and `ttl` is ignored. That is the right default for
@@ -141,6 +175,12 @@ Read the poller's result comment, not simply the newest one, and look for the
 result label. A closed issue is not by itself proof of execution: people close
 issues too.
 
+A capability job's result comment opens with `receipt: <id>  changed: <n>`.
+The id names a receipt file the operator can look up; the changed count is
+how many paths the poller saw change under that capability's own declared
+`changed_roots`, not a scan of the whole filesystem, so a command that wrote
+somewhere else will not show up in it.
+
 The default cycle is 60 seconds between polls, not a promise that your job
 finishes within a minute. Jobs run one at a time in the order they were created,
 at most 30 per cycle, so a long earlier command delays yours. A single command
@@ -176,6 +216,16 @@ output somewhere and read it back in bounded pieces.
   wanted before refiling it with a fresh deadline.
 - **non-zero exit, timeout, or start failure** - read stderr and check the
   relevant state. A failure does not prove nothing happened.
+- **disabled** - the operator's kill switch is on. The poller keeps polling
+  and the label stays; nothing starts until the operator clears it. Wait for
+  them, do not refile.
+- **rate limited** - the job is over the hourly cap for its class. It keeps
+  its label and runs once the window has room; refiling only adds another job
+  behind the same cap.
+- **awaiting approval** - the capability is `destructive`, `spend`, or
+  `external-send` and needs an `/approve <digest>` comment from the owner
+  login. See [Privileged capabilities need the owner's
+  approval](#privileged-capabilities-need-the-owners-approval).
 
 **An open issue with the label removed is ambiguous.** The poller drops the
 label before it starts the command, so that issue is either running now or was

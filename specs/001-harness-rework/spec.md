@@ -19,8 +19,9 @@ this Mac without any path to a general shell. Lightweight spec for an existing c
    paths that changed under the capability's declared roots. The issue result comment
    carries the receipt id.
 4. **Owner authority for `destructive`, `spend`, `external-send`.** Such a job waits
-   until a comment `/approve <digest8>` by the configured owner login exists on the
-   issue. An approval is single-use. A passkey-gateway approval route is P4.
+   until a comment `/approve <digest>` by the configured owner login exists on the
+   issue, where the digest covers the capability name and the parameters together.
+   An approval is single-use. A passkey-gateway approval route is P4.
 5. **Kill switch.** One file, `~/.config/issue-bridge/DISABLED`, stops the poller from
    starting any job while leaving labels in place; `status.json` says so. A `harness`
    helper touches the same file for every intake it knows about.
@@ -67,10 +68,10 @@ Config, new keys beside the existing ones:
 "owner": "abhaymettu",
 "rate": {"jobs_per_hour": 30, "privileged_per_hour": 5},
 "capabilities": {
-  "git-pull": {"argv": ["git", "-C", "/Users/abhay/src/{repo}", "pull", "--ff-only"],
-               "params": {"repo": "^[a-z0-9-]{1,40}$"},
+  "git-pull": {"argv": ["git", "-C", "{repo}", "pull", "--ff-only"],
+               "params": {"repo": "^/Users/abhay/src/[a-z0-9-]{1,40}$"},
                "class": "mutate", "timeout": 120,
-               "changed_roots": ["/Users/abhay/src/{repo}"]},
+               "changed_roots": ["{repo}"]},
   "lane-prompt": {"argv": ["/Users/abhay/src/issue-bridge/lane", "prompt", "{lane}", "{job}", "{text}"],
                   "params": {"lane": "^[a-z0-9-]{1,32}$", "job": "^[0-9]{1,8}$", "text": "^[\\s\\S]{1,12000}$"},
                   "class": "destructive", "timeout": 60, "changed_roots": []}

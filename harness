@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# harness - the narrow privileged helper for issue-bridge, atlas-gateway and
+# direct-line.
+#
+# This is the one thing a sudoers line should ever name. Every action below
+# is a fixed argv behind a fixed name; the only free argument anywhere is a
+# LaunchAgent label picked from a short enumerated list, never free text and
+# never a path. That is what lets `NOPASSWD: ALL` become one line naming
+# this script instead of naming a shell. Today none of the actions here
+# actually need root, so the sudoers change is optional, not required by
+# this file existing.
+#
+# Actions: kill, resume, status, rotate-pat, rotate-direct-line-secret,
+# restart <label>, --self-check. Anything else is a usage error, exit 64.
+set -euo pipefail
+
+# launchd and other callers hand this script a minimal PATH; the fixed dirs
+# come first so a weird inherited PATH cannot shadow a system tool.
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+export PATH
+
+err()   { printf '%s\n' "$*" >&2; }
+die()   { err "harness: $*"; exit 1; }
+usage() { err "usage: $2"; exit "$1"; }
+
+USAGE_LINE="harness <kill|resume|status|rotate-pat|rotate-direct-line-secret|restart <label>|--self-check>"
+
+# State roots, overridable for tests so a dry run never touches the real
+# home directory.
+ISSUE_BRIDGE_HOME="${ISSUE_BRIDGE_HOME:-$HOME/.config/issue-bridge}"
+ATLAS_GATEWAY_HOME="${ATLAS_GATEWAY_HOME:-$HOME/.atlas-gateway}"
+DIRECT_LINE_HOME="${DIRECT_LINE_HOME:-$HOME/.config/direct-line}"
+DOMAIN="gui/$(id -u)"
+
+# The fixed label enum. This is the only place a caller-supplied argument
+# is accepted anywhere in this script, and it is checked against this list,
+# never interpolated unchecked.
+valid_label() {
+  case "$1" in
+    bridge.poller|com.abhay.atlas-gateway|com.abhay.direct-line) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# HARNESS_DRY_RUN=1 makes every launchctl call print the command instead of
+# running it. --self-check sets this so it can exercise the real code paths
+# without touching real launchd state.
+run_launchctl() {
+  if [ "${HARNESS_DRY_RUN:-0}" = 1 ]; then
+    printf '[dry-run] launchctl %s\n' "$*"
+    return 0
+  fi
+  launchctl "$@"
+}
+
+# --- kill / resume ---------------------------------------------------------
+
+cmd_kill() {
+  [ $# -eq 0 ] || usage 64 "harness kill"
+  local root
+  for root in "$ISSUE_BRIDGE_HOME" "$ATLAS_GATEWAY_HOME" "$DIRECT_LINE_HOME"; do
+    if [ -d "$root" ]; then
+      # Only touch the marker; never create the root itself. A root that
+      # does not exist is a service that has never run here.
+      touch "$root/DISABLED"
+      echo "disabled: touched $root/DISABLED"
+    else
+      echo "skip: $root does not exist"
+    fi
+  done
+}
+
+cmd_resume() {
+  [ $# -eq 0 ] || usage 64 "harness resume"
+  local root
+  for root in "$ISSUE_BRIDGE_HOME" "$ATLAS_GATEWAY_HOME" "$DIRECT_LINE_HOME"; do
+    if [ -f "$root/DISABLED" ]; then
+      rm -f "$root/DISABLED"
+      echo "resumed: removed $root/DISABLED"
+    elif [ -d "$root" ]; then
+      echo "resumed: $root/DISABLED was not present"
+    else
+      echo "skip: $root does not exist"
+    fi
+  done
+}
+
+# --- status ------------------------------------------------------------
+
+cmd_status() {
+  [ $# -eq 0 ] || usage 64 "harness status"
+
+  if [ -f "$ISSUE_BRIDGE_HOME/DISABLED" ]; then
+    echo "issue-bridge DISABLED: present"
+  else
+    echo "issue-bridge DISABLED: absent"
+  fi
+
+  if [ -f "$ISSUE_BRIDGE_HOME/status.json" ]; then
+    # Read-only and defensive: a partial or malformed status.json prints
+    # "unreadable" instead of stopping the whole action.
+    python3 -c '
+import json, sys, time
+try:
+    with open(sys.argv[1]) as f:
+        s = json.load(f)
+except Exception:
+    print("issue-bridge status.json: unreadable")
+    sys.exit(0)
+
+def field(key):
+    v = s.get(key)
+    if v is None:
+        return "absent"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return v
+
+last_poll_ok = s.get("last_poll_ok")
+if last_poll_ok:
+    age = "%ds" % (time.time() - last_poll_ok)
+else:
+    age = "absent"
+
+print("issue-bridge last_poll_ok age:", age)
+for k in ("version", "runner", "queue_depth", "last_error", "pat_expiry", "disabled", "rate_limited"):
+    print("issue-bridge %s:" % k, field(k))
+' "$ISSUE_BRIDGE_HOME/status.json"
+  else
+    echo "issue-bridge status.json: absent"
+  fi
+
+  if [ -f "$ATLAS_GATEWAY_HOME/DISABLED" ]; then
+    echo "atlas-gateway DISABLED: present"
+  else
+    echo "atlas-gateway DISABLED: absent"
+  fi
+
+  if [ -f "$ATLAS_GATEWAY_HOME/audit.jsonl" ]; then
+    local n
+    n="$(wc -l < "$ATLAS_GATEWAY_HOME/audit.jsonl" 2>/dev/null | tr -d ' ')" || n=0
+    echo "atlas-gateway audit.jsonl: present, ${n:-0} lines"
+  else
+    echo "atlas-gateway audit.jsonl: absent"
+  fi
+
+  if [ -f "$DIRECT_LINE_HOME/DISABLED" ]; then
+    echo "direct-line DISABLED: present"
+  else
+    echo "direct-line DISABLED: absent"
+  fi
+  if [ "${HARNESS_DRY_RUN:-0}" = 1 ]; then
+    echo "direct-line launchd: dry-run (would check: launchctl print $DOMAIN/com.abhay.direct-line)"
+  elif launchctl print "$DOMAIN/com.abhay.direct-line" >/dev/null 2>&1; then
+    echo "direct-line launchd: loaded"
+  else
+    echo "direct-line launchd: not loaded"
+  fi
+}
+
+# --- rotate-pat --------------------------------------------------------
+
+cmd_rotate_pat() {
+  [ $# -eq 0 ] || usage 64 "harness rotate-pat (reads the new token on stdin)"
+  [ -d "$ISSUE_BRIDGE_HOME" ] || die "rotate-pat: $ISSUE_BRIDGE_HOME does not exist"
+  [ -f "$ISSUE_BRIDGE_HOME/config.json" ] || die "rotate-pat: $ISSUE_BRIDGE_HOME/config.json missing"
+
+  local repo pat hdr body ok expiry
+  repo="$(python3 -c 'import json, sys
+c = json.load(open(sys.argv[1]))
+repo = c.get("repo")
+if not repo:
+    sys.exit(1)
+print(repo)' "$ISSUE_BRIDGE_HOME/config.json")" || die "rotate-pat: config.json has no repo"
+
+  pat="$(tr -d "[:space:]")"  # a token never contains whitespace
+  [ -n "$pat" ] || die "rotate-pat: empty token on stdin"
+  case "$pat" in *\"*) die "rotate-pat: a token never contains a double quote" ;; esac
+
+  if [ "${HARNESS_DRY_RUN:-0}" = 1 ]; then
+    echo "[dry-run] curl -K - https://api.github.com/repos/$repo (verify token, header from stdin)"
+    echo "[dry-run] rotate-pat: skipping write and kickstart"
+    return 0
+  fi
+
+  # Same shape as install.sh's api(): the token travels to curl over stdin
+  # via -K, never on argv, so it cannot show up in `ps`.
+  umask 077
+  hdr="$(mktemp)"; body="$(mktemp)"
+  trap 'rm -f "$hdr" "$body"' RETURN
+
+  printf 'header = "Authorization: Bearer %s"\n' "$pat" |
+    curl -sS -K - -X GET \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      -D "$hdr" -o "$body" \
+      "https://api.github.com/repos/$repo" || die "rotate-pat: curl could not reach the GitHub API"
+
+  ok="$(python3 -c 'import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("no")
+    sys.exit(0)
+print("yes" if "full_name" in d else "no")' "$body")"
+  [ "$ok" = yes ] || die "rotate-pat: token did not verify against $repo"
+
+  expiry="$(grep -i '^github-authentication-token-expiration:' "$hdr" 2>/dev/null |
+            tail -1 | cut -d: -f2- | tr -d '\r' | sed 's/^ *//')"
+
+  printf '%s\n' "$pat" > "$ISSUE_BRIDGE_HOME/github-token.tmp"
+  mv -f "$ISSUE_BRIDGE_HOME/github-token.tmp" "$ISSUE_BRIDGE_HOME/github-token"
+
+  run_launchctl kickstart -k "$DOMAIN/bridge.poller"
+
+  if [ -n "$expiry" ]; then
+    echo "rotated (expires: $expiry)"
+  else
+    echo "rotated"
+  fi
+}
+
+# --- rotate-direct-line-secret ------------------------------------------
+
+cmd_rotate_direct_line_secret() {
+  [ $# -eq 0 ] || usage 64 "harness rotate-direct-line-secret"
+  [ -d "$DIRECT_LINE_HOME" ] || die "rotate-direct-line-secret: $DIRECT_LINE_HOME does not exist"
+
+  local secret
+  secret="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  umask 077
+  printf '%s\n' "$secret" > "$DIRECT_LINE_HOME/secret.tmp"
+  mv -f "$DIRECT_LINE_HOME/secret.tmp" "$DIRECT_LINE_HOME/secret"
+
+  run_launchctl kickstart -k "$DOMAIN/com.abhay.direct-line"
+  echo "rotated (clients must be updated by hand)"
+}
+
+# --- restart -------------------------------------------------------------
+
+cmd_restart() {
+  [ $# -eq 1 ] || usage 64 "harness restart <bridge.poller|com.abhay.atlas-gateway|com.abhay.direct-line>"
+  local label="$1"
+  valid_label "$label" ||
+    usage 64 "harness restart <label> - label must be one of: bridge.poller, com.abhay.atlas-gateway, com.abhay.direct-line"
+  run_launchctl kickstart -k "$DOMAIN/$label"
+  echo "restarted: $label"
+}
+
+# --- self-check ----------------------------------------------------------
+
+cmd_self_check() {
+  [ $# -eq 0 ] || usage 64 "harness --self-check"
+  local self tmp ib ag dl total=0 fails=0 out rc
+
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/harness-self-check.XXXXXX")"
+  trap 'rm -rf "$tmp"' RETURN
+
+  ib="$tmp/issue-bridge"; ag="$tmp/atlas-gateway"; dl="$tmp/direct-line"
+  mkdir -p "$ib" "$ag" "$dl"
+
+  check() { # <label> <test argv...> - PASS/FAIL by the test's exit code
+    total=$((total + 1))
+    if "${@:2}" >/dev/null 2>&1; then
+      echo "PASS  $1"
+    else
+      echo "FAIL  $1"
+      fails=$((fails + 1))
+    fi
+  }
+  check_rc() { # <label> <expected-rc> <actual-rc>
+    total=$((total + 1))
+    if [ "$3" -eq "$2" ]; then
+      echo "PASS  $1"
+    else
+      echo "FAIL  $1 (exit $3, want $2)"
+      fails=$((fails + 1))
+    fi
+  }
+  # Re-invokes this script as a subprocess with the three HOMEs pointed at
+  # the tempdir and HARNESS_DRY_RUN=1, so launchctl and curl are never
+  # called for real, however deep an action's dry-run guard sits.
+  run_self() {
+    ISSUE_BRIDGE_HOME="$ib" ATLAS_GATEWAY_HOME="$ag" DIRECT_LINE_HOME="$dl" \
+      HARNESS_DRY_RUN=1 "$self" "$@"
+  }
+  capture() { out="$(run_self "$@" 2>&1)" && rc=0 || rc=$?; }
+
+  capture kill
+  check_rc "kill exits 0" 0 "$rc"
+  check "kill touches issue-bridge DISABLED" test -f "$ib/DISABLED"
+  check "kill touches atlas-gateway DISABLED" test -f "$ag/DISABLED"
+  check "kill touches direct-line DISABLED" test -f "$dl/DISABLED"
+
+  rm -rf "$dl"
+  capture kill
+  check_rc "kill skips a missing root without failing" 0 "$rc"
+  check "kill does not recreate a missing root" test ! -e "$dl"
+  mkdir -p "$dl"
+
+  capture status
+  check_rc "status exits 0 against sparse roots" 0 "$rc"
+  check "status reports issue-bridge DISABLED present" \
+    bash -c 'printf "%s" "$1" | grep -q "issue-bridge DISABLED: present"' _ "$out"
+  check "status never calls real launchctl" \
+    bash -c 'printf "%s" "$1" | grep -q "dry-run"' _ "$out"
+
+  capture resume
+  check_rc "resume exits 0" 0 "$rc"
+  check "resume removes issue-bridge DISABLED" test ! -f "$ib/DISABLED"
+  check "resume removes atlas-gateway DISABLED" test ! -f "$ag/DISABLED"
+
+  capture restart nope
+  check_rc "restart nope (bad label) exits 64" 64 "$rc"
+
+  capture restart bridge.poller
+  check_rc "restart bridge.poller (dry-run) exits 0" 0 "$rc"
+
+  capture bogus-action
+  check_rc "unknown action exits 64" 64 "$rc"
+
+  echo "$((total - fails))/$total passed"
+  [ "$fails" -eq 0 ]
+}
+
+# --- dispatch --------------------------------------------------------------
+
+case "${1:-}" in
+  kill)                      shift; cmd_kill "$@" ;;
+  resume)                    shift; cmd_resume "$@" ;;
+  status)                    shift; cmd_status "$@" ;;
+  rotate-pat)                shift; cmd_rotate_pat "$@" ;;
+  rotate-direct-line-secret) shift; cmd_rotate_direct_line_secret "$@" ;;
+  restart)                   shift; cmd_restart "$@" ;;
+  --self-check)              shift; cmd_self_check "$@" ;;
+  *) usage 64 "$USAGE_LINE" ;;
+esac

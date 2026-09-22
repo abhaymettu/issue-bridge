@@ -102,6 +102,41 @@ There is no SDK. The protocol is an issue body, and it is written down in
    operation needs real constraints, allowlist a wrapper script you wrote, not a
    prefix of a general-purpose tool.
 
+   **Capabilities replace the allowlist.** A capability is a named argv
+   template with typed parameters, a class, a timeout and the roots it may
+   change, so a caller sends a capability name and parameters and never sends
+   argv. Three new config keys sit beside `repo`, `label`, `allow` and
+   `poll_interval`:
+
+   ```json
+   "owner": "abhaymettu",
+   "rate": {"jobs_per_hour": 30, "privileged_per_hour": 5},
+   "capabilities": {
+     "git-pull": {"argv": ["git", "-C", "{repo}", "pull", "--ff-only"],
+                  "params": {"repo": "^/Users/abhay/src/[a-z0-9-]{1,40}$"},
+                  "class": "mutate", "timeout": 120,
+                  "changed_roots": ["{repo}"]},
+     "lane-prompt": {"argv": ["/Users/abhay/src/issue-bridge/lane", "prompt", "{lane}", "{job}", "{text}"],
+                     "params": {"lane": "^[a-z0-9-]{1,32}$", "job": "^[0-9]{1,8}$", "text": "^[\\s\\S]{1,12000}$"},
+                     "class": "destructive", "timeout": 60, "changed_roots": []}
+   }
+   ```
+
+   `owner` is the GitHub login whose `/approve` comments count. `rate` caps
+   jobs per hour, overall and for the three privileged classes. Each
+   capability's `{name}` placeholder must fill a whole argv token, substituted
+   once, and must match its regex in full, a fullmatch not a search. A
+   parameter the template does not declare is refused, and so is a value that
+   contains a NUL or that resolves outside `changed_roots` when the template
+   places it in a path. `changed_roots` itself must be absolute paths under
+   `$HOME`.
+
+   `allow` still works exactly as above while it is non-empty, and a caller
+   may send `argv:` bodies as long as it does. Emptying `allow` is the switch
+   to capabilities-only; there is no separate flag. See
+   [specs/001-harness-rework/](specs/001-harness-rework/) for why the config
+   is shaped this way.
+
 5. **Hand your agent [AGENTS.md](AGENTS.md).** Paste it into the agent's system
    prompt, drop it in its repo, or just link it. Tell the agent which repo is
    the lane. That is the entire integration.
@@ -265,6 +300,64 @@ what that costs, or run it as a LaunchDaemon instead. A LaunchDaemon is a
 separate deployment this installer does not write; it can be pointed at a
 non-root `UserName`, so it does not have to mean running commands as root.
 
+### Receipts
+
+A capability job writes one JSON receipt to
+`~/.config/issue-bridge/receipts/<utc>-<issue>.json`: an id, the actor (issue
+author and whoever applied the label), the capability name, a sha256 of the
+parameters, the approval id if the job needed one, the class, exit code,
+duration, the paths that changed under the capability's declared roots (capped,
+with a truncated flag), which runner ran it, and start and finish times. The
+result comment's first line is `receipt: <id>  changed: <n>`, so you can find
+the file from the issue without opening it. Parameter values never appear in a
+comment, a log line, or the receipt itself, only their sha256; if you need to
+know what a job actually ran, that has to come from the capability's own
+argv template and the digest, not from the receipt. See
+[specs/001-harness-rework/spec.md](specs/001-harness-rework/spec.md) for the
+full receipt shape.
+
+### Kill switch and rate limits
+
+Touching `~/.config/issue-bridge/DISABLED` stops the poller from starting any
+job. It keeps polling, labels stay on waiting issues, and it comments nothing;
+`status.json` reports the disabled state so you can see it without guessing.
+Removing the file lets new jobs start again; nothing that was already running
+is affected either way.
+
+`rate.jobs_per_hour` caps all jobs and `rate.privileged_per_hour` caps the
+three classes that need owner approval (below). A job over its cap keeps its
+label and waits for the window to open rather than being dropped or denied.
+
+The `harness` helper touches the same file for every intake it knows about:
+`harness kill` disables issue-bridge, the Atlas gateway and direct-line
+together, `harness resume` clears the kill switch, and `harness status` reads
+all three status files. See the poller's `--self-test` for the exact gating
+this enforces.
+
+### Owner approval
+
+Three classes need a human before they run: `destructive`, `spend`, and
+`external-send`. A job in one of those classes waits until a comment
+`/approve <digest>` by the login in the config's `owner` field appears on the
+issue; the digest covers the capability name and the parameters together, only
+that login counts, and an approval is single-use. The poller posts
+one comment saying what to approve, then waits: it does not repeat the prompt
+on later cycles. If the job never gets its approval, it simply keeps its label
+and sits, same as a job waiting on a rate cap.
+
+### Secrets
+
+| Secret | Lives at | Consumer | Rotate with |
+| --- | --- | --- | --- |
+| GitHub PAT | `~/.config/issue-bridge/github-token` | the poller | `harness rotate-pat`, reads the new token from stdin |
+| direct-line secret | `~/.config/direct-line/secret` | the direct-line daemon | `harness rotate-direct-line-secret`; update clients by hand |
+| Worker token | login keychain item `life-dashboard-writer` | the atlas-aqua wrapper only | replace the keychain item's value |
+| Orca device pairings | `~/Library/Application Support/orca/orca-devices.json` | Orca | revoke in the Orca app |
+| perch device and shell tokens | `~/.perch-bridge/device.token` and `shell.token` | Hammerspoon instinct-daemon | regenerate and update clients |
+
+The `harness` helper only rotates the first two rows. The rest are listed here
+so nobody has to go looking for where they live or who reads them.
+
 ## Security and delivery limits
 
 **The boundary is an open issue carrying the job label on the designated repo.**
@@ -281,7 +374,12 @@ scoped to the allowlist.
   from running the wrong thing. It is not a sandbox: commands run as you, with
   your files and your credentials, and a command that itself takes arbitrary
   input (a shell, an interpreter, `ssh`) hands the whole boundary away. Do not
-  allowlist those.
+  allowlist those. This is not hypothetical: a live-config audit found `/bin/zsh`
+  on an `allow` list, which is a full shell for anyone who can label an issue,
+  because prefix matching admits every argument that follows. Capabilities are
+  the fix, since a capability has a fixed argv template and typed parameters
+  instead of a prefix a caller can extend. See
+  [specs/001-harness-rework/audit.md](specs/001-harness-rework/audit.md).
 - **Denials are final and visible.** A denied job gets a comment saying so and
   closes `exec-failed`, so a wrong allowlist shows up as a closed issue rather
   than as a mystery.
@@ -352,6 +450,18 @@ side-effecting job until you know whether it ran.
 **Can two Macs share one lane?** No. Dropping the label is not a lock, so two
 pollers can fetch and run the same issue. Give each Mac its own repo, or its own
 label with one poller each.
+
+**Why did my job get an approval comment instead of running?** Its capability
+is `destructive`, `spend`, or `external-send`. Those classes wait for a comment
+`/approve <digest>` from the login in the config's `owner` field before they
+run at all; nobody else's approval counts, and it is single-use. See
+[Owner approval](#owner-approval).
+
+**The poller says disabled, what now?** Someone or something touched
+`~/.config/issue-bridge/DISABLED`. The poller keeps polling and labels stay on
+waiting issues, but nothing starts until the file is gone. Ask the operator to
+run `harness resume`, or remove the file directly if that is you. See
+[Kill switch and rate limits](#kill-switch-and-rate-limits).
 
 **Linux or Windows?** The poller is stdlib Python and does not care, but the
 installer, the LaunchAgent and these instructions are macOS. Nothing here sets up
