@@ -10,7 +10,7 @@ no inbound port, no tunnel, no VPN.
 
 Protocol: AGENTS.md. Setup: README.md.
 """
-import calendar, json, os, pathlib, shlex, shutil, subprocess, sys, tempfile, threading, time
+import calendar, hashlib, hmac, http.server, json, os, pathlib, shlex, shutil, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request
 
 VERSION = "1.1.0"
@@ -32,7 +32,7 @@ TIMEOUT = 900           # per-command wall clock
 _status = {"version": VERSION, "ts": 0, "last_poll_ok": None, "last_drain_ts": None,
            "queue_depth": 0, "last_error": None, "pat_expiry": None,
            "pending_writebacks": [], "legacy_label_jobs": [], "runner": None,
-           "running": None}
+           "running": None, "doorbell": None}
 
 
 def config():
@@ -628,8 +628,76 @@ def poll(cfg):
             if label != cfg["label"]:
                 i["legacy_label"] = label
             issues.append(i)
+    # The label-filtered list lags a new issue by 10 s or more; the single-issue
+    # endpoint does not. Label and state still come from the API, never the payload.
+    wanted = set(labels)
+    while RUNG:
+        n = RUNG.pop()
+        try:
+            i = gh(cfg, "GET", "/issues/%d" % n)
+        except urllib.error.HTTPError:
+            continue
+        names = {l["name"] for l in (i or {}).get("labels", [])}
+        if (not i or i.get("state") != "open" or "pull_request" in i
+                or n in seen or not names & wanted):
+            continue
+        seen.add(n)
+        if cfg["label"] not in names:
+            i["legacy_label"] = sorted(names & wanted)[0]
+        issues.append(i)
     issues.sort(key=lambda i: i.get("created_at") or "")
     return issues
+
+
+# Doorbell (specs/001-webhook-doorbell): a signed GitHub webhook only wakes the poll loop
+# early. The payload is never read for commands; the normal poll decides what runs, so
+# this adds latency savings and nothing to what the bridge will execute.
+WAKE = threading.Event()
+RUNG = set()  # issue numbers named by signed webhooks; poll() fetches them directly
+SECRET = HOME / "webhook-secret"
+
+
+def ring_ok(body, sig):
+    try:
+        key = SECRET.read_bytes().strip()
+    except OSError:
+        return False
+    want = "sha256=" + hmac.new(key, body, hashlib.sha256).hexdigest()
+    return bool(key) and hmac.compare_digest(want, sig or "")
+
+
+class Doorbell(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if self.path != "/github-hook":
+            return self.send_error(404)
+        if not 0 <= n <= 1 << 20:
+            return self.send_error(413)
+        body = self.rfile.read(n)
+        ok = ring_ok(body, self.headers.get("X-Hub-Signature-256"))
+        if ok:
+            try:  # only the number is used, to pick which issue to re-fetch from the API
+                num = json.loads(body)["issue"]["number"]
+                if isinstance(num, int):
+                    RUNG.add(num)
+            except (ValueError, KeyError, TypeError):
+                pass
+            WAKE.set()
+        self.send_response(204 if ok else 401)
+        self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+def start_doorbell(port):
+    """Bound once at startup; a changed webhook_port needs a poller restart."""
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Doorbell)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
 
 
 def cycle(cfg):
@@ -876,6 +944,40 @@ def self_test():
             globals()["orca"], globals()["TIMEOUT"] = real_orca, real_timeout
             globals()["JOBS"] = real_jobs
 
+    # doorbell: only a correctly signed ring wakes the loop
+    real_secret = SECRET
+    with tempfile.TemporaryDirectory() as td:
+        globals()["SECRET"] = pathlib.Path(td) / "secret"
+        check("doorbell refuses without a secret", not ring_ok(b"{}", "sha256=00"))
+        SECRET.write_text("k\n")
+        good = "sha256=" + hmac.new(b"k", b"{}", hashlib.sha256).hexdigest()
+        check("doorbell accepts a valid signature", ring_ok(b"{}", good))
+        check("doorbell rejects a tampered body", not ring_ok(b"{ }", good))
+        check("doorbell rejects a missing signature", not ring_ok(b"{}", None))
+        srv = start_doorbell(0)
+        url = "http://127.0.0.1:%d/github-hook" % srv.server_address[1]
+
+        def post(sig, data=b"{}"):
+            req = urllib.request.Request(url, data=data, method="POST",
+                                         headers={"X-Hub-Signature-256": sig})
+            try:
+                return urllib.request.urlopen(req, timeout=5).status
+            except urllib.error.HTTPError as e:
+                return e.code
+        WAKE.clear()
+        check("bad ring is 401 and does not wake", post("sha256=00") == 401 and not WAKE.is_set())
+        check("good ring is 204 and wakes the loop", post(good) == 204 and WAKE.is_set())
+        named = b'{"issue": {"number": 7}}'
+        sig = "sha256=" + hmac.new(b"k", named, hashlib.sha256).hexdigest()
+        RUNG.clear()
+        post("sha256=00", named)
+        check("unsigned ring names no issue", not RUNG)
+        check("signed ring names its issue", post(sig, named) == 204 and RUNG == {7})
+        RUNG.clear()
+        srv.shutdown()
+        WAKE.clear()
+    globals()["SECRET"] = real_secret
+
     for name, ok in results:
         print("%-42s %s" % (name, "PASS" if ok else "FAIL"))
     bad = sum(1 for _, ok in results if not ok)
@@ -889,6 +991,7 @@ if __name__ == "__main__":
     if "--run-job" in sys.argv:
         sys.exit(run_job(sys.argv[sys.argv.index("--run-job") + 1]))
     once = "--once" in sys.argv
+    doorbell = None
     while True:
         try:
             cfg = config()
@@ -899,7 +1002,15 @@ if __name__ == "__main__":
                 sys.exit(1)
             time.sleep(60)
             continue
+        if not once and doorbell is None and cfg.get("webhook_port"):
+            try:
+                doorbell = start_doorbell(int(cfg["webhook_port"]))
+                _status["doorbell"] = "listening 127.0.0.1:%s" % cfg["webhook_port"]
+            except OSError as e:  # port taken: keep polling, say why
+                doorbell = False
+                _status["doorbell"] = "off: %s" % e
         cycle(cfg)
         if once:
             break
-        time.sleep(cfg["poll_interval"])
+        WAKE.wait(cfg["poll_interval"])  # a signed webhook ends the wait early
+        WAKE.clear()
