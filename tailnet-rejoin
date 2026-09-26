@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Let Instinct back onto this Mac over SSH after its environment is rebuilt.
+
+Instinct runs this through the bridge (which survives rebuilds) with the public key of
+its fresh environment:
+
+    tailnet-rejoin 'ssh-ed25519 AAAA... anything'
+
+It replaces Instinct's previous key in ~/.ssh/authorized_keys and prints a single-use,
+pre-approved, ephemeral Tailscale auth key that expires in an hour. Instinct then runs
+`tailscale up --authkey <key> --hostname instinct-cloud` and SSHes in. Ephemeral means
+dead environments drop off the tailnet on their own.
+
+Needs a Tailscale API access token at ~/.config/tailscale/api-token (mode 0600).
+"""
+import json, os, pathlib, re, sys, urllib.request
+
+TAG = "instinct-cloud"  # comment that marks Instinct's key in authorized_keys
+TOKEN = pathlib.Path.home() / ".config/tailscale/api-token"
+KEYS = pathlib.Path.home() / ".ssh/authorized_keys"
+
+
+def install_key(pub):
+    m = re.fullmatch(r"(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256) ([A-Za-z0-9+/=]+)( .*)?", pub.strip())
+    if not m:
+        sys.exit("not a single SSH public key line")
+    KEYS.parent.mkdir(mode=0o700, exist_ok=True)
+    old = KEYS.read_text().splitlines() if KEYS.exists() else []
+    kept = [l for l in old if not l.rstrip().endswith(" " + TAG)]
+    KEYS.write_text("\n".join(kept + ["%s %s %s" % (m[1], m[2], TAG)]) + "\n")
+    KEYS.chmod(0o600)
+    return len(old) - len(kept)
+
+
+def mint_authkey():
+    if not TOKEN.exists() or TOKEN.stat().st_mode & 0o077:
+        sys.exit("no Tailscale API token at %s (mode 0600)" % TOKEN)
+    body = {"capabilities": {"devices": {"create": {
+                "reusable": False, "ephemeral": True, "preauthorized": True}}},
+            "expirySeconds": 3600, "description": "instinct rejoin"}
+    req = urllib.request.Request(
+        "https://api.tailscale.com/api/v2/tailnet/-/keys", method="POST",
+        data=json.dumps(body).encode(),
+        headers={"Authorization": "Bearer " + TOKEN.read_text().strip(),
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())["key"]
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        sys.exit(__doc__)
+    replaced = install_key(sys.argv[1])
+    print("ssh key installed for %s (replaced %d old)" % (TAG, replaced))
+    print("authkey:", mint_authkey())
+    print("mac:", os.popen("/usr/local/bin/tailscale ip -4 2>/dev/null").read().strip() or "unknown")

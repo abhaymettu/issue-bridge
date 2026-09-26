@@ -32,7 +32,9 @@ TIMEOUT = 900           # per-command wall clock
 _status = {"version": VERSION, "ts": 0, "last_poll_ok": None, "last_drain_ts": None,
            "queue_depth": 0, "last_error": None, "pat_expiry": None,
            "pending_writebacks": [], "legacy_label_jobs": [], "runner": None,
-           "running": None, "doorbell": None}
+           "running": {}, "doorbell": None}
+_lock = threading.Lock()  # guards BUSY and the status file write
+BUSY = {}  # lane label -> issue number its worker is running (specs/002-parallel-lanes)
 
 
 def config():
@@ -51,11 +53,12 @@ def write_status():
     """Never fatal. A poller that dies because it could not write its own
     status file is worse than one whose status file is stale."""
     try:
-        _status["ts"] = time.time()
-        tmp = STATUS.with_suffix(".tmp")
-        tmp.write_text(json.dumps(_status, indent=1) + "\n")
-        tmp.replace(STATUS)
-    except OSError:
+        with _lock:
+            _status["ts"] = time.time()
+            tmp = STATUS.with_suffix(".tmp")
+            tmp.write_text(json.dumps(_status, indent=1) + "\n")
+            tmp.replace(STATUS)
+    except (OSError, RuntimeError):  # RuntimeError: a worker changed _status mid-dump
         pass
 
 
@@ -292,7 +295,8 @@ def await_job(cfg, jobdir, handle, started):
     bounded slices so an Orca restart mid-job costs one slice, not the job. Past
     TIMEOUT the tab is closed, which hangs up the PTY and everything the command
     started under it; whatever it printed before that is kept."""
-    deadline = started + TIMEOUT
+    limit = cfg.get("timeout") or TIMEOUT
+    deadline = started + limit
     while True:
         if (jobdir / "exit.json").exists():
             return job_result(jobdir)
@@ -312,7 +316,7 @@ def await_job(cfg, jobdir, handle, started):
         return job_result(jobdir, None if (jobdir / "exit.json").exists() else
                           "the Orca terminal ended without recording a result")
     orca(cfg, "terminal", "close", "--terminal", handle, "--tab")
-    r = job_result(jobdir, "timeout after %ds; the Orca terminal was closed" % TIMEOUT)
+    r = job_result(jobdir, "timeout after %ds; the Orca terminal was closed" % limit)
     r["exit"], r["duration"] = None, round(time.time() - started, 3)
     return r
 
@@ -341,13 +345,13 @@ def run_visible(cfg, issue, argv, rec):
         return hidden(argv, "orca terminal create failed")
     rec.update({"jobdir": str(jobdir), "terminal": handle, "started": started})
     save_pending(rec)
-    _status["running"] = {"issue": n, "terminal": handle, "lane": str(lane),
-                          "started_at": now(), "title": title}
+    _status["running"][cfg["label"]] = {"issue": n, "terminal": handle, "lane": str(lane),
+                                        "started_at": now(), "title": title}
     write_status()
     try:
         return await_job(cfg, jobdir, handle, started)
     finally:
-        _status["running"] = None
+        _status["running"].pop(cfg["label"], None)
 
 
 def resume_job(cfg, rec):
@@ -493,8 +497,10 @@ def writeback(cfg, rec):
 def drain_pending(cfg):
     """Retry unfinished writebacks from earlier cycles. These issues have already
     lost the label, so the poll query never returns them again."""
+    with _lock:
+        in_flight = set(BUSY.values())
     for _, rec in list(iter_pending()):
-        if not rec:
+        if not rec or rec.get("issue") in in_flight:  # its worker owns it
             continue
         if rec.get("jobdir"):  # the pre-run record of a job that ran in Orca
             # body=None: the original issue body is not at hand, and a PATCH without it
@@ -617,7 +623,7 @@ def poll(cfg):
     because nothing was listening on the name the filer used.
     """
     seen, issues = set(), []
-    labels = [cfg["label"]] + legacy_aliases(cfg)
+    labels = lanes(cfg) + legacy_aliases(cfg)
     for label in labels:
         got = gh(cfg, "GET", "/issues?state=open&labels=%s&sort=created"
                              "&direction=asc&per_page=30" % urllib.parse.quote(label)) or []
@@ -625,7 +631,8 @@ def poll(cfg):
             if "pull_request" in i or i["number"] in seen:
                 continue
             seen.add(i["number"])
-            if label != cfg["label"]:
+            i["lane"] = label if label in lanes(cfg) else cfg["label"]
+            if label not in lanes(cfg):
                 i["legacy_label"] = label
             issues.append(i)
     # The label-filtered list lags a new issue by 10 s or more; the single-issue
@@ -642,7 +649,9 @@ def poll(cfg):
                 or n in seen or not names & wanted):
             continue
         seen.add(n)
-        if cfg["label"] not in names:
+        mine = [l for l in lanes(cfg) if l in names]
+        i["lane"] = mine[0] if mine else cfg["label"]
+        if not mine:
             i["legacy_label"] = sorted(names & wanted)[0]
         issues.append(i)
     issues.sort(key=lambda i: i.get("created_at") or "")
@@ -700,6 +709,52 @@ def start_doorbell(port):
     return srv
 
 
+def lanes(cfg):
+    return cfg.get("lanes") or [cfg["label"]]
+
+
+def lane_cfg(cfg, lane):
+    return dict(cfg, label=lane, timeout=(cfg.get("lane_timeouts") or {}).get(lane))
+
+
+def work(cfg, issue):
+    """One job on one lane's worker thread. The list the issue came from lags GitHub by
+    10 s or more, so a job that just finished can still be in it: re-read the issue and
+    run it only if it still carries this lane's label."""
+    n = issue["number"]
+    try:
+        fresh = gh(cfg, "GET", "/issues/%d" % n) or {}
+        names = {l["name"] for l in fresh.get("labels", [])}
+        if load_pending(n) or (fresh.get("state") == "open"
+                               and names & set([cfg["label"]] + legacy_aliases(cfg))):
+            handle(cfg, dict(fresh, legacy_label=issue.get("legacy_label")))
+            _status["last_drain_ts"] = time.time()
+    except Exception as e:  # one bad job must not stop the lane
+        _status["last_error"] = "issue #%d: %r" % (n, e)
+    finally:
+        with _lock:
+            BUSY.pop(cfg["label"], None)
+        _status["pending_writebacks"] = pending_status()
+        write_status()
+        WAKE.set()  # this lane is free; dispatch its next job now
+
+
+def dispatch(cfg, issues):
+    """Start each idle lane on its oldest job (control jobs first). Lanes run in
+    parallel; within a lane, one job at a time."""
+    started = []
+    for issue in control_first(issues):
+        lane = issue.get("lane") or cfg["label"]
+        with _lock:
+            if lane in BUSY or issue["number"] in BUSY.values():
+                continue
+            BUSY[lane] = issue["number"]
+        t = threading.Thread(target=work, args=(lane_cfg(cfg, lane), issue), daemon=True)
+        t.start()
+        started.append(t)
+    return started
+
+
 def cycle(cfg):
     _status["runner"] = cfg.get("runner")
     drain_pending(cfg)  # unfinished writebacks first: their issues lost the label
@@ -721,14 +776,7 @@ def cycle(cfg):
         print("issue #%d carries the legacy label %r; running it as %r. Refile future jobs "
               "with %r." % (i["issue"], i["label"], cfg["label"], cfg["label"]), flush=True)
     write_status()
-    for issue in control_first(issues):
-        try:
-            handle(cfg, issue)
-            _status["last_drain_ts"] = time.time()
-        except Exception as e:  # one bad job must not stop the lane
-            _status["last_error"] = "issue #%d: %r" % (issue["number"], e)
-        _status["pending_writebacks"] = pending_status()
-        write_status()
+    return dispatch(cfg, issues)
 
 
 def self_test():
@@ -944,6 +992,40 @@ def self_test():
             globals()["orca"], globals()["TIMEOUT"] = real_orca, real_timeout
             globals()["JOBS"] = real_jobs
 
+    # lanes: different lanes run at once, one lane stays serial, a stale list entry is skipped
+    real_gh, real_handle, real_lp = gh, handle, load_pending
+    ran, live = [], {"open": {1, 2, 3}}
+    def fake_gh(cfg, method, path, body=None):
+        n = int(path.rsplit("/", 1)[1])
+        return {"number": n, "state": "open", "labels": [{"name": cfg["label"]}]
+                if n in live["open"] else []}
+    def fake_handle(cfg, issue):
+        ran.append((cfg["label"], issue["number"], time.time()))
+        time.sleep(0.3)
+    globals()["gh"], globals()["handle"], globals()["load_pending"] = fake_gh, fake_handle, lambda n: None
+    try:
+        lc = {"label": "exec-job", "lanes": ["exec-job", "exec-deep-1"], "allow": []}
+        first = dispatch(lc, [{"number": 1, "lane": "exec-job"}, {"number": 2, "lane": "exec-deep-1"},
+                              {"number": 3, "lane": "exec-job"}])
+        check("two lanes start together, busy lane waits", len(first) == 2)
+        for t in first:
+            t.join()
+        check("the two lanes overlapped", len(ran) == 2 and abs(ran[0][2] - ran[1][2]) < 0.2)
+        second = dispatch(lc, [{"number": 3, "lane": "exec-job"}])
+        for t in second:
+            t.join()
+        check("freed lane takes its next job", [r[1] for r in ran] [-1:] == [3])
+        live["open"].discard(1)
+        n_before = len(ran)
+        for t in dispatch(lc, [{"number": 1, "lane": "exec-job"}]):
+            t.join()
+        check("stale list entry is not run again", len(ran) == n_before and not BUSY)
+        check("per-lane timeout comes from lane_timeouts",
+              lane_cfg({"label": "x", "lane_timeouts": {"exec-fast": 60}}, "exec-fast")["timeout"] == 60)
+    finally:
+        globals()["gh"], globals()["handle"], globals()["load_pending"] = real_gh, real_handle, real_lp
+        WAKE.clear()
+
     # doorbell: only a correctly signed ring wakes the loop
     real_secret = SECRET
     with tempfile.TemporaryDirectory() as td:
@@ -1009,8 +1091,10 @@ if __name__ == "__main__":
             except OSError as e:  # port taken: keep polling, say why
                 doorbell = False
                 _status["doorbell"] = "off: %s" % e
-        cycle(cfg)
+        workers = cycle(cfg) or []
         if once:
+            for t in workers:
+                t.join()
             break
         WAKE.wait(cfg["poll_interval"])  # a signed webhook ends the wait early
         WAKE.clear()
