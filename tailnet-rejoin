@@ -8,15 +8,18 @@ its fresh environment:
 
 It replaces Instinct's previous key in ~/.ssh/authorized_keys and prints a single-use,
 pre-approved, ephemeral Tailscale auth key that expires in an hour. Instinct then runs
-`tailscale up --authkey <key> --hostname instinct-cloud` and SSHes in. Ephemeral means
-dead environments drop off the tailnet on their own.
+`tailscale up --authkey <key> --hostname instinct-cloud --advertise-tags tag:instinct`
+and SSHes in. Ephemeral means dead environments drop off the tailnet on their own.
 
-Needs a Tailscale API access token at ~/.config/tailscale/api-token (mode 0600).
+Needs a Tailscale OAuth client secret (scope auth_keys, tag tag:instinct) at
+~/.config/tailscale/oauth-client-secret (mode 0600). OAuth clients do not expire; the
+API access tokens this used to take expire in at most 90 days.
 """
-import json, os, pathlib, re, sys, urllib.request
+import json, os, pathlib, re, sys, urllib.parse, urllib.request
 
 TAG = "instinct-cloud"  # comment that marks Instinct's key in authorized_keys
-TOKEN = pathlib.Path.home() / ".config/tailscale/api-token"
+SECRET = pathlib.Path.home() / ".config/tailscale/oauth-client-secret"
+API = "https://api.tailscale.com/api/v2"
 KEYS = pathlib.Path.home() / ".ssh/authorized_keys"
 
 
@@ -32,16 +35,24 @@ def install_key(pub):
     return len(old) - len(kept)
 
 
+def access_token():
+    if not SECRET.exists() or SECRET.stat().st_mode & 0o077:
+        sys.exit("no Tailscale OAuth client secret at %s (mode 0600)" % SECRET)
+    secret = SECRET.read_text().strip()
+    client_id = secret.split("-")[2]  # tskey-client-<id>-<random>
+    form = urllib.parse.urlencode({"client_id": client_id, "client_secret": secret}).encode()
+    with urllib.request.urlopen(API + "/oauth/token", data=form, timeout=30) as r:
+        return json.loads(r.read())["access_token"]
+
+
 def mint_authkey():
-    if not TOKEN.exists() or TOKEN.stat().st_mode & 0o077:
-        sys.exit("no Tailscale API token at %s (mode 0600)" % TOKEN)
     body = {"capabilities": {"devices": {"create": {
-                "reusable": False, "ephemeral": True, "preauthorized": True}}},
-            "expirySeconds": 3600, "description": "instinct rejoin"}
+                "reusable": False, "ephemeral": True, "preauthorized": True,
+                "tags": ["tag:instinct"]}}},
+            "expirySeconds": 3600, "description": "instinct-rejoin"}
     req = urllib.request.Request(
-        "https://api.tailscale.com/api/v2/tailnet/-/keys", method="POST",
-        data=json.dumps(body).encode(),
-        headers={"Authorization": "Bearer " + TOKEN.read_text().strip(),
+        API + "/tailnet/-/keys", method="POST", data=json.dumps(body).encode(),
+        headers={"Authorization": "Bearer " + access_token(),
                  "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())["key"]
