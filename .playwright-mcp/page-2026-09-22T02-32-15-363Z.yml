@@ -1,0 +1,8 @@
+- main [ref=f1e2]:
+  - paragraph [ref=f1e3]: Locked
+  - heading "atlas is locked" [level=1] [ref=f1e4]
+  - paragraph [ref=f1e5]: Nothing loads until you unlock.
+  - generic [ref=f1e6]:
+    - button "Unlock" [ref=f1e7] [cursor=pointer]
+    - status [ref=f1e12]
+    - button "Add another device" [ref=f1e13]

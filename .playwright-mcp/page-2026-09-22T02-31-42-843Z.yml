@@ -1,0 +1,31 @@
+- generic [ref=e3]:
+  - link "Skip to content" [ref=e4] [cursor=pointer]:
+    - /url: "#main"
+  - complementary [ref=e5]:
+    - generic [ref=e6]:
+      - paragraph [ref=e8]: atlas
+      - button "Search ⌘ K" [ref=e9]:
+        - generic [ref=e13]: Search
+        - generic:
+          - generic: ⌘
+          - text: K
+      - navigation "Sections" [ref=e14]:
+        - button "Overview" [ref=e15]
+        - button "Today" [ref=e22]
+        - button "Calendar" [ref=e26]
+        - button "Needs You" [ref=e30]
+        - button "Terminal" [ref=e35]
+        - button "GRE" [ref=e40]
+        - button "Decisions" [ref=e45]
+        - button "Mission Control" [ref=e51]
+        - button "Projects" [ref=e56]
+        - button "Gym" [ref=e61]
+        - button "People" [ref=e69]
+        - button "Reads" [ref=e76]
+        - button "Thoughts" [ref=e81]
+        - button "What's New" [ref=e85]
+        - button "Settings" [ref=e89]
+      - link "Text Instinct" [ref=e95] [cursor=pointer]:
+        - /url: sms:+16502834124
+  - main [ref=e100]:
+    - generic [ref=e101]: Loading
